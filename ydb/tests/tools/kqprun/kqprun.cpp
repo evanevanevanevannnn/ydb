@@ -32,6 +32,9 @@ namespace NKqpRun {
 namespace {
 
 struct TExecutionOptions {
+    inline static constexpr char LOOP_ID_TEMPLATE[] = "${LOOP_ID}";
+    inline static constexpr char QUERY_ID_TEMPLATE[] = "${QUERY_ID}";
+
     enum class EExecutionCase {
         GenericScript,
         GenericQuery,
@@ -43,6 +46,7 @@ struct TExecutionOptions {
     TString SchemeQuery;
     std::unordered_map<TString, Ydb::TypedValue> Params;
     bool UseTemplates = false;
+    bool RunAsDeamon = false;
 
     ui32 LoopCount = 1;
     TDuration QueryDelay;
@@ -108,8 +112,8 @@ struct TExecutionOptions {
 
         TString sql = ScriptQueries[index];
         if (UseTemplates) {
-            SubstGlobal(sql, "${LOOP_ID}", ToString(loopId));
-            SubstGlobal(sql, "${QUERY_ID}", ToString(queryId));
+            SubstGlobal(sql, LOOP_ID_TEMPLATE, ToString(loopId));
+            SubstGlobal(sql, QUERY_ID_TEMPLATE, ToString(queryId));
         }
 
         return {
@@ -127,7 +131,7 @@ struct TExecutionOptions {
     }
 
     void Validate(const TRunnerOptions& runnerOptions) const {
-        if (!SchemeQuery && ScriptQueries.empty() && !runnerOptions.YdbSettings.MonitoringEnabled && !runnerOptions.YdbSettings.GrpcEnabled) {
+        if (!SchemeQuery && ScriptQueries.empty() && !runnerOptions.YdbSettings.MonitoringEnabled && !runnerOptions.YdbSettings.GrpcEnabled && !RunAsDeamon) {
             ythrow yexception() << "Nothing to execute and is not running as daemon";
         }
 
@@ -277,12 +281,12 @@ private:
 };
 
 
-void RunArgumentQuery(size_t index, size_t loopId, size_t queryId, TInstant startTime, const TExecutionOptions& executionOptions, TKqpRunner& runner) {
+void RunArgumentQuery(size_t index, size_t loopId, size_t queryId, TInstant startTime, const TExecutionOptions& executionOptions, TKqpRunner& runner, TDuration& duration) {
     NColorizer::TColors colors = NColorizer::AutoColors(Cout);
 
     switch (executionOptions.GetExecutionCase(index)) {
         case TExecutionOptions::EExecutionCase::GenericScript: {
-            if (!runner.ExecuteScript(executionOptions.GetScriptQueryOptions(index, loopId, queryId, startTime))) {
+            if (!runner.ExecuteScript(executionOptions.GetScriptQueryOptions(index, loopId, queryId, startTime), duration)) {
                 ythrow yexception() << TInstant::Now().ToIsoStringLocal() << " Script execution failed";
             }
             Cout << colors.Yellow() << TInstant::Now().ToIsoStringLocal() << " Fetching script results..." << colors.Default() << Endl;
@@ -299,14 +303,14 @@ void RunArgumentQuery(size_t index, size_t loopId, size_t queryId, TInstant star
         }
 
         case TExecutionOptions::EExecutionCase::GenericQuery: {
-            if (!runner.ExecuteQuery(executionOptions.GetScriptQueryOptions(index, loopId, queryId, startTime))) {
+            if (!runner.ExecuteQuery(executionOptions.GetScriptQueryOptions(index, loopId, queryId, startTime), duration)) {
                 ythrow yexception() << TInstant::Now().ToIsoStringLocal() << " Query execution failed";
             }
             break;
         }
 
         case TExecutionOptions::EExecutionCase::YqlScript: {
-            if (!runner.ExecuteYqlScript(executionOptions.GetScriptQueryOptions(index, loopId, queryId, startTime))) {
+            if (!runner.ExecuteYqlScript(executionOptions.GetScriptQueryOptions(index, loopId, queryId, startTime), duration)) {
                 ythrow yexception() << TInstant::Now().ToIsoStringLocal() << " Yql script execution failed";
             }
             break;
@@ -336,6 +340,9 @@ void RunArgumentQueries(const TExecutionOptions& executionOptions, TKqpRunner& r
     }
 
     const size_t numberLoops = executionOptions.LoopCount;
+    std::vector<double> durations;
+    const size_t maxQueueSize = numberLoops ? (numberLoops * 7 + 9) / 10 : 10;
+    double durationSec = 0.0;
     for (size_t queryId = 0; queryId < numberQueries * numberLoops || numberLoops == 0; ++queryId) {
         size_t id = queryId % numberQueries;
         if (queryId > 0) {
@@ -356,7 +363,20 @@ void RunArgumentQueries(const TExecutionOptions& executionOptions, TKqpRunner& r
         }
 
         try {
-            RunArgumentQuery(id, loopId, queryId, startTime, executionOptions, runner);
+            TDuration duration;
+            RunArgumentQuery(id, loopId, queryId, startTime, executionOptions, runner, duration);
+            durationSec += duration.SecondsFloat();
+            if (id + 1 == numberQueries) {
+                if (durationSec > 0.001) {
+                    durations.push_back(durationSec);
+                    std::push_heap(durations.begin(), durations.end());
+                    if (durations.size() > maxQueueSize) {
+                        std::pop_heap(durations.begin(), durations.end());
+                        durations.pop_back();
+                    }
+                }
+                durationSec = 0.0;
+            }
         } catch (const yexception& exception) {
             if (executionOptions.ContinueAfterFail) {
                 Cerr << colors.Red() <<  CurrentExceptionMessage() << colors.Default() << Endl;
@@ -365,6 +385,14 @@ void RunArgumentQueries(const TExecutionOptions& executionOptions, TKqpRunner& r
             }
         }
     }
+
+    if (durations.size() > 1) {
+        auto gmean = pow(std::accumulate(durations.begin(), durations.end(), 1.0, std::multiplies<double>()), 1.0 / durations.size());
+        Cout << colors.Cyan()
+             << "Geometric mean of " << durations.size() << " best iterations: " << TDuration::MicroSeconds(static_cast<ui64>(gmean * 1000000.0))
+             << colors.Default() << Endl;
+    }
+
     runner.FinalizeRunner();
 
     if (executionOptions.HasResults()) {
@@ -403,7 +431,8 @@ void RunScript(const TExecutionOptions& executionOptions, const TRunnerOptions& 
         }
     }
 
-    if (runnerOptions.YdbSettings.MonitoringEnabled || runnerOptions.YdbSettings.GrpcEnabled) {
+    if (executionOptions.RunAsDeamon ||
+        ((runnerOptions.YdbSettings.MonitoringEnabled || runnerOptions.YdbSettings.GrpcEnabled) && executionOptions.ScriptQueries.empty() && !executionOptions.SchemeQuery)) {
         RunAsDaemon();
     }
 
@@ -414,11 +443,10 @@ void RunScript(const TExecutionOptions& executionOptions, const TRunnerOptions& 
 class TMain : public TMainBase {
     using EVerbose = TYdbSetupSettings::EVerbose;
 
-    inline static const TString YqlToken = GetEnv(YQL_TOKEN_VARIABLE);
-
     TDuration PingPeriod;
     TExecutionOptions ExecutionOptions;
     TRunnerOptions RunnerOptions;
+    std::optional<ui64> UserPoolSize;
 
     std::unordered_map<TString, TString> Templates;
     THashMap<TString, TString> TablesMapping;
@@ -454,7 +482,7 @@ protected:
             .RequiredArgument("str")
             .AppendTo(&ExecutionOptions.ScriptQueries);
 
-        options.AddLongOption("templates", "Enable templates for -s and -p queries, such as ${YQL_TOKEN} and ${QUERY_ID}")
+        options.AddLongOption("templates", TStringBuilder() << "Enable templates for -s and -p queries, such as ${" << YQL_TOKEN_VARIABLE << "}, " << TExecutionOptions::QUERY_ID_TEMPLATE << " and " << TExecutionOptions::LOOP_ID_TEMPLATE)
             .NoArgument()
             .SetFlag(&ExecutionOptions.UseTemplates);
 
@@ -779,6 +807,15 @@ protected:
 
         // Cluster settings
 
+        options.AddLongOption("threads", "User pool size for each node (also scaled system, batch and IC pools in proportion: system / user / batch / IC = 1 / 10 / 1 / 1)")
+            .RequiredArgument("uint")
+            .StoreMappedResultT<ui32>(&UserPoolSize, [](ui32 threadsCount) {
+                if (threadsCount < 1) {
+                    ythrow yexception() << "Number of threads less than one";
+                }
+                return threadsCount;
+            });
+
         options.AddLongOption('N', "node-count", "Number of nodes to create")
             .RequiredArgument("uint")
             .DefaultValue(RunnerOptions.YdbSettings.NodeCount)
@@ -878,6 +915,10 @@ protected:
             .NoArgument()
             .SetFlag(&RunnerOptions.YdbSettings.DisableDiskMock);
 
+        options.AddLongOption("hold", "Hold kqprun process after finishing all -s and -p queries")
+            .NoArgument()
+            .SetFlag(&ExecutionOptions.RunAsDeamon);
+
         RegisterKikimrOptions(options, RunnerOptions.YdbSettings);
     }
 
@@ -899,6 +940,7 @@ protected:
         }
         queryService.SetProgressStatsPeriodMs(PingPeriod.MilliSeconds());
 
+        SetupActorSystemConfig();
         SetupLogsConfig();
 
         if (EmulateYt) {
@@ -955,12 +997,7 @@ private:
             SubstGlobal(sql, TStringBuilder() << "${" << variable <<"}", value);
         }
         if (ExecutionOptions.UseTemplates) {
-            const TString tokenVariableName = TStringBuilder() << "${" << YQL_TOKEN_VARIABLE << "}";
-            if (const TString& yqlToken = GetEnv(YQL_TOKEN_VARIABLE)) {
-                SubstGlobal(sql, tokenVariableName, yqlToken);
-            } else if (sql.Contains(tokenVariableName)) {
-                ythrow yexception() << "Failed to replace ${YQL_TOKEN} template, please specify YQL_TOKEN environment variable";
-            }
+            ReplaceYqlTokenTemplate(sql);
         }
     }
 
@@ -970,6 +1007,61 @@ private:
             logConfig.SetDefaultLevel(*DefaultLogPriority);
         }
         ModifyLogPriorities(LogPriorities, logConfig);
+    }
+
+    void SetupActorSystemConfig() {
+        if (!UserPoolSize) {
+            return;
+        }
+
+        auto& asConfig = *RunnerOptions.YdbSettings.AppConfig.MutableActorSystemConfig();
+
+        if (!asConfig.HasScheduler()) {
+            auto& scheduler = *asConfig.MutableScheduler();
+            scheduler.SetResolution(64);
+            scheduler.SetSpinThreshold(0);
+            scheduler.SetProgressThreshold(10000);
+        }
+
+        asConfig.ClearExecutor();
+
+        const auto addExecutor = [&asConfig](const TString& name, ui64 threads, NKikimrConfig::TActorSystemConfig::TExecutor::EType type, std::optional<ui64> spinThreshold = std::nullopt) {
+            auto& executor = *asConfig.AddExecutor();
+            executor.SetName(name);
+            executor.SetThreads(threads);
+            executor.SetType(type);
+            if (spinThreshold) {
+                executor.SetSpinThreshold(*spinThreshold);
+            }
+            return executor;
+        };
+
+        const auto divideThreads = [](ui64 threads, ui64 divisor) {
+            if (threads < 1) {
+                ythrow yexception() << "Threads must be greater than 0";
+            }
+            return (threads - 1) / divisor + 1;
+        };
+
+        addExecutor("System", divideThreads(*UserPoolSize, 10), NKikimrConfig::TActorSystemConfig::TExecutor::BASIC, 10);
+        asConfig.SetSysExecutor(0);
+
+        addExecutor("User", *UserPoolSize, NKikimrConfig::TActorSystemConfig::TExecutor::BASIC, 1);
+        asConfig.SetUserExecutor(1);
+
+        addExecutor("Batch", divideThreads(*UserPoolSize, 10), NKikimrConfig::TActorSystemConfig::TExecutor::BASIC, 1);
+        asConfig.SetBatchExecutor(2);
+
+        addExecutor("IO", 1, NKikimrConfig::TActorSystemConfig::TExecutor::IO);
+        asConfig.SetIoExecutor(3);
+
+        addExecutor("IC", divideThreads(*UserPoolSize, 10), NKikimrConfig::TActorSystemConfig::TExecutor::BASIC, 10)
+            .SetTimePerMailboxMicroSecs(100);
+        auto& serviceExecutors = *asConfig.MutableServiceExecutor();
+        serviceExecutors.Clear();
+        auto& serviceExecutor = *serviceExecutors.Add();
+        serviceExecutor.SetServiceName("Interconnect");
+        serviceExecutor.SetExecutorId(4);
     }
 };
 

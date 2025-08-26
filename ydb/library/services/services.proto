@@ -192,6 +192,7 @@ enum EServiceKikimr {
     CHOOSE_PROXY = 444;
     LB_CONFIG_MANAGER = 445;
     PQ_PARTITION_CHOOSER = 462;
+    PQ_TX = 2201;
 
     TOKEN_BUILDER = 450;
     TICKET_PARSER = 455;
@@ -432,6 +433,8 @@ enum EServiceKikimr {
     BRIDGE = 3400;
 
     TRANSFER = 3500;
+
+    TOKEN_MANAGER = 3600;
 };
 
 message TActivity {
@@ -1104,5 +1107,6 @@ message TActivity {
         RECOMPUTE_KMEANS_SCAN_ACTOR = 663;
         BS_HULL_SYNC_FULL_UNORDERED_DATA_PROTOCOL = 664;
         SCHEMESHARD_SYSVIEWS_ROSTER_UPDATE = 665;
+        TOKEN_MANAGER_ACTOR = 666;
     };
 };

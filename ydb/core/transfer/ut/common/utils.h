@@ -71,7 +71,7 @@ struct Timestamp64Checker : public Checker<TInstant> {
     }
 
     TInstant Get(const ::Ydb::Value& value) override {
-        return TInstant::MilliSeconds(value.int64_value());
+        return TInstant::MicroSeconds(value.uint64_value());
     }
 
     void Assert(const std::string& msg, const ::Ydb::Value& value) override {
@@ -249,7 +249,7 @@ struct MainTestCase {
         return config;
     }
 
-    MainTestCase(const std::optional<std::string> user = std::nullopt, std::string tableType = "COLUMN")
+    MainTestCase(const std::optional<std::string> user = std::nullopt, std::string tableType = "ROW")
         : TableType(std::move(tableType))
         , Id(RandomNumber<size_t>())
         , ConnectionString(GetEnv("YDB_ENDPOINT") + "/?database=" + GetEnv("YDB_DATABASE"))
@@ -321,8 +321,16 @@ struct MainTestCase {
     }
 
     void Grant(const std::string& object, const std::string& username, const std::vector<std::string>& permissions) {
+        ChangePermissions("GRANT", "TO", object, username, permissions);
+    }
+
+    void Revoke(const std::string& object, const std::string& username, const std::vector<std::string>& permissions) {
+        ChangePermissions("REVOKE", "FROM", object, username, permissions);
+    }
+
+    void ChangePermissions(const std::string& statement, const std::string& statementClause, const std::string& object, const std::string& username, const std::vector<std::string>& permissions) {
         TStringBuilder sql;
-        sql << "GRANT ";
+        sql << statement << " ";
         for (size_t i = 0; i < permissions.size(); ++i) {
             if (i) {
                 sql << ", ";
@@ -337,7 +345,7 @@ struct MainTestCase {
         if (!object.empty()) {
             sql << "/" << object;
         }
-        sql << "` TO `" << username << "@builtin`";
+        sql << "` " << statementClause << " `" << username << "@builtin`";
 
         ExecuteDDL(sql);
     }
@@ -616,7 +624,7 @@ struct MainTestCase {
         ExecuteDDL(Sprintf(R"(
             ALTER TRANSFER `%s`
             SET (
-                STATE = "StandBy"
+                STATE = "Active"
             );
         )", TransferName.data()));
     }
@@ -638,8 +646,8 @@ struct MainTestCase {
     }
 
     auto DescribeConsumer() {
-        auto topic = DescribeTopic();
-        auto consumers = topic.GetTopicDescription().GetConsumers();
+        const auto topic = DescribeTopic();
+        const auto& consumers = topic.GetTopicDescription().GetConsumers();
         UNIT_ASSERT_VALUES_EQUAL(1, consumers.size());
         return DescribeConsumer(consumers[0].GetConsumerName());
     }
@@ -678,13 +686,17 @@ struct MainTestCase {
         ExecuteDDL(Sprintf("DROP ASYNC REPLICATION `%s`;", ReplicationName.data()));
     }
 
-    auto DescribeReplication() {
+    auto DescribeReplication(const std::string& name) {
         TReplicationClient client(Driver);
 
         TDescribeReplicationSettings settings;
         settings.IncludeStats(true);
 
-        return client.DescribeReplication(TString("/") + GetEnv("YDB_DATABASE") + "/" + ReplicationName, settings).ExtractValueSync();
+        return client.DescribeReplication(TString("/") + GetEnv("YDB_DATABASE") + "/" + name, settings).ExtractValueSync();
+    }
+
+    auto DescribeReplication() {
+        return DescribeReplication(ReplicationName);
     }
 
     TReplicationDescription CheckReplicationState(TReplicationDescription::EState expected) {
@@ -854,7 +866,7 @@ struct MainTestCase {
         UNIT_ASSERT(result.GetErrorState().GetIssues().ToOneLineString().contains(expectedMessage));
     }
 
-    void Run(const TConfig& config) {
+    void Run(const TConfig& config, const CreateTransferSettings settings = {}) {
 
         CreateTable(config.TableDDL);
         CreateTopic();
@@ -866,7 +878,7 @@ struct MainTestCase {
         for (size_t i = 0; i < lambdas.size(); ++i) {
             auto lambda = lambdas[i];
             if (!i) {
-                CreateTransfer(lambda);
+                CreateTransfer(lambda, settings);
             } else {
                 Sleep(TDuration::Seconds(1));
 

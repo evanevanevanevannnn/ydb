@@ -33,6 +33,8 @@
 #include <ydb/core/kqp/federated_query/kqp_federated_query_helpers.h>
 #include <ydb/core/security/ticket_parser.h>
 #include <ydb/core/security/ticket_parser_settings.h>
+#include <ydb/core/security/token_manager/token_manager.h>
+#include <ydb/core/security/token_manager/token_manager_settings.h>
 #include <ydb/core/base/grpc_service_factory.h>
 #include <ydb/core/persqueue/actor_persqueue_client_iface.h>
 #include <ydb/core/fq/libs/shared_resources/interface/shared_resources.h>
@@ -183,6 +185,7 @@ namespace Tests {
         bool EnableStorage = true;
 
         std::function<IActor*(const TTicketParserSettings&)> CreateTicketParser = NKikimr::CreateTicketParser;
+        std::function<IActor*(const TTokenManagerSettings&)> CreateTokenManager = NKikimr::CreateTokenManager;
         std::shared_ptr<TGrpcServiceFactory> GrpcServiceFactory;
         std::shared_ptr<NYql::NDq::IS3ActorsFactory> S3ActorsFactory = NYql::NDq::CreateDefaultS3ActorsFactory();
 
@@ -398,6 +401,7 @@ namespace Tests {
         const NYdb::TDriver& GetDriver() const;
         const NYdbGrpc::TGRpcServer& GetGRpcServer() const;
         const NYdbGrpc::TGRpcServer& GetTenantGRpcServer(const TString& tenant) const;
+        TIntrusivePtr<NMemory::IProcessMemoryInfoProvider> GetProcessMemoryInfoProvider() const;
 
         ui32 StaticNodes() const {
             return Settings->NodeCount;
@@ -420,6 +424,7 @@ namespace Tests {
         const NBus::TBusServerSessionConfig BusServerSessionConfig; //BusServer hold const & on config
         TAutoPtr<NMsgBusProxy::IMessageBusServer> BusServer;
         NFq::IYqSharedResources::TPtr YqSharedResources;
+        TIntrusivePtr<NMemory::IProcessMemoryInfoProvider> ProcessMemoryInfoProvider;
 
         TTestActorRuntime::TEventObserverHolder SysViewsRosterUpdateObserver;
         bool SysViewsRosterUpdateFinished;
@@ -495,12 +500,72 @@ namespace Tests {
                 request->Record.SetSecurityToken(SecurityToken);
         }
 
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusSchemeOperationStatus>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
         void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusSchemeInitRoot>& request) {
             if (!SecurityToken.empty())
                 request->Record.SetSecurityToken(SecurityToken);
         }
 
         void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusSchemeDescribe>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusCmsRequest>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusConsoleRequest>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusResolveNode>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusFillNode>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusDrainNode>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusBlobStorageConfigRequest>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusChooseProxy>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusHiveCreateTablet>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusTestShardControlRequest>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusInterconnectDebug>& request) {
+            if (!SecurityToken.empty())
+                request->Record.SetSecurityToken(SecurityToken);
+        }
+
+        void PrepareRequest(TAutoPtr<NMsgBusProxy::TBusTabletStateRequest>& request) {
             if (!SecurityToken.empty())
                 request->Record.SetSecurityToken(SecurityToken);
         }
@@ -706,7 +771,7 @@ namespace Tests {
         // Waits for scheme operation to complete
         NBus::EMessageStatus WaitCompletion(ui64 txId, ui64 schemeshard, ui64 pathId,
                                             TAutoPtr<NBus::TBusMessage>& reply,
-                                            TDuration timeout = TDuration::Seconds(1000));
+                                            TDuration timeout = TDuration::Seconds(1000), const TString& securityToken = {});
         NBus::EMessageStatus SendAndWaitCompletion(TAutoPtr<NMsgBusProxy::TBusSchemeOperation> request,
                                                    TAutoPtr<NBus::TBusMessage>& reply,
                                                    TDuration timeout = TDuration::Seconds(1000));

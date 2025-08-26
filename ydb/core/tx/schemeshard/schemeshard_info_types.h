@@ -51,6 +51,7 @@
 #include <util/generic/guid.h>
 #include <util/generic/ptr.h>
 #include <util/generic/queue.h>
+#include <util/generic/set.h>
 #include <util/generic/vector.h>
 
 namespace NKikimr {
@@ -825,6 +826,11 @@ public:
     }
 
     bool ShouldSplitBySize(ui64 dataSize, const TForceShardSplitSettings& params, TString& reason) const {
+        // Don't split/merge backup tables
+        if (IsBackup) {
+            return false;
+        }
+
         if (!IsSplitBySizeEnabled(params)) {
             return false;
         }
@@ -993,8 +999,8 @@ struct TTopicTabletInfo : TSimpleRefCount<TTopicTabletInfo> {
         // Split and merge operations form the partitions graph. Each partition created in this way has a parent
         // partition. In turn, the parent partition knows about the partitions formed after the split and merge
         // operations.
-        THashSet<ui32> ParentPartitionIds;
-        THashSet<ui32> ChildPartitionIds;
+        TSet<ui32> ParentPartitionIds;
+        TSet<ui32> ChildPartitionIds;
 
         TShardIdx ShardIdx;
 
@@ -1401,8 +1407,10 @@ struct IQuotaCounters {
     virtual void ChangeDiskSpaceSoftQuotaBytes(i64 delta) = 0;
     virtual void AddDiskSpaceSoftQuotaBytes(EUserFacingStorageType storageType, ui64 addend) = 0;
     virtual void ChangePathCount(i64 delta) = 0;
+    virtual void SetPathCount(ui64 value) = 0;
     virtual void SetPathsQuota(ui64 value) = 0;
     virtual void ChangeShardCount(i64 delta) = 0;
+    virtual void SetShardCount(ui64 value) = 0;
     virtual void SetShardsQuota(ui64 value) = 0;
 };
 
@@ -1700,6 +1708,8 @@ struct TSubDomainInfo: TSimpleRefCount<TSubDomainInfo> {
     ui64 GetBackupShards() const {
         return BackupShards.size();
     }
+
+    void UpdateCounters(IQuotaCounters* counters);
 
     void ActualizeAlterData(const THashMap<TShardIdx, TShardInfo>& allShards, TInstant now, bool isExternal, IQuotaCounters* counters) {
         Y_ENSURE(AlterData);
@@ -3044,11 +3054,21 @@ struct TIndexBuildInfo: public TSimpleRefCount<TIndexBuildInfo> {
 
         Cancellation_Applying = 350,
         Cancellation_Unlocking = 360,
+        Cancellation_DroppingColumns = 370,
         Cancelled = 400,
 
         Rejection_Applying = 500,
         Rejection_Unlocking = 510,
+        Rejection_DroppingColumns = 520,
         Rejected = 550
+    };
+
+    enum class ESubState: ui32 {
+        // Common
+        None = 0,
+
+        // Filling
+        UniqIndexValidation = 100,
     };
 
     struct TColumnBuildInfo {
@@ -3086,6 +3106,7 @@ struct TIndexBuildInfo: public TSimpleRefCount<TIndexBuildInfo> {
         BuildSecondaryIndex = 10,
         BuildVectorIndex = 11,
         BuildPrefixedVectorIndex = 12,
+        BuildSecondaryUniqueIndex = 13,
         BuildColumns = 20,
     };
 
@@ -3177,6 +3198,7 @@ struct TIndexBuildInfo: public TSimpleRefCount<TIndexBuildInfo> {
     TKMeans KMeans;
 
     EState State = EState::Invalid;
+    ESubState SubState = ESubState::None;
 private:
     TString Issue;
 public:
@@ -3193,6 +3215,7 @@ public:
     bool InitiateTxDone = false;
     bool ApplyTxDone = false;
     bool UnlockTxDone = false;
+    bool DropColumnsTxDone = false;
 
     bool BillingEventIsScheduled = false;
 
@@ -3201,12 +3224,14 @@ public:
     TTxId InitiateTxId = TTxId();
     TTxId ApplyTxId = TTxId();
     TTxId UnlockTxId = TTxId();
+    TTxId DropColumnsTxId = TTxId();
 
     NKikimrScheme::EStatus AlterMainTableTxStatus = NKikimrScheme::StatusSuccess;
     NKikimrScheme::EStatus LockTxStatus = NKikimrScheme::StatusSuccess;
     NKikimrScheme::EStatus InitiateTxStatus = NKikimrScheme::StatusSuccess;
     NKikimrScheme::EStatus ApplyTxStatus = NKikimrScheme::StatusSuccess;
     NKikimrScheme::EStatus UnlockTxStatus = NKikimrScheme::StatusSuccess;
+    NKikimrScheme::EStatus DropColumnsTxStatus = NKikimrScheme::StatusSuccess;
 
     TStepId SnapshotStep;
     TTxId SnapshotTxId;
@@ -3421,6 +3446,8 @@ public:
 
         indexInfo->State = TIndexBuildInfo::EState(
             row.template GetValue<Schema::IndexBuild::State>());
+        indexInfo->SubState = TIndexBuildInfo::ESubState(
+            row.template GetValueOrDefault<Schema::IndexBuild::SubState>(ui32(TIndexBuildInfo::ESubState::None)));
         indexInfo->Issue =
             row.template GetValueOrDefault<Schema::IndexBuild::Issue>();
 
@@ -3509,6 +3536,16 @@ public:
             row.template GetValueOrDefault<Schema::IndexBuild::AlterMainTableTxDone>(
                 indexInfo->AlterMainTableTxDone);
 
+        indexInfo->DropColumnsTxId =
+            row.template GetValueOrDefault<Schema::IndexBuild::DropColumnsTxId>(
+                indexInfo->DropColumnsTxId);
+        indexInfo->DropColumnsTxStatus =
+            row.template GetValueOrDefault<Schema::IndexBuild::DropColumnsTxStatus>(
+                indexInfo->DropColumnsTxStatus);
+        indexInfo->DropColumnsTxDone =
+            row.template GetValueOrDefault<Schema::IndexBuild::DropColumnsTxDone>(
+                indexInfo->DropColumnsTxDone);
+
         indexInfo->Billed.SetUploadRows(row.template GetValueOrDefault<Schema::IndexBuild::UploadRowsBilled>(0));
         indexInfo->Billed.SetUploadBytes(row.template GetValueOrDefault<Schema::IndexBuild::UploadBytesBilled>(0));
         indexInfo->Billed.SetReadRows(row.template GetValueOrDefault<Schema::IndexBuild::ReadRowsBilled>(0));
@@ -3554,6 +3591,9 @@ public:
                     break;
             }
         }
+
+        LOG_DEBUG_S(TlsActivationContext->AsActorContext(), NKikimrServices::BUILD_INDEX,
+            "Restored index build id# " << indexInfo->Id << ": " << *indexInfo);
     }
 
     template<class TRow>
@@ -3604,11 +3644,15 @@ public:
     }
 
     bool IsFillBuildIndex() const {
-        return IsBuildSecondaryIndex() || IsBuildColumns();
+        return IsBuildSecondaryIndex() || IsBuildSecondaryUniqueIndex() || IsBuildColumns();
     }
 
     bool IsBuildSecondaryIndex() const {
         return BuildKind == EBuildKind::BuildSecondaryIndex;
+    }
+
+    bool IsBuildSecondaryUniqueIndex() const {
+        return BuildKind == EBuildKind::BuildSecondaryUniqueIndex;
     }
 
     bool IsBuildPrefixedVectorIndex() const {
@@ -3620,7 +3664,7 @@ public:
     }
 
     bool IsBuildIndex() const {
-        return IsBuildSecondaryIndex() || IsBuildVectorIndex();
+        return IsBuildSecondaryIndex() || IsBuildSecondaryUniqueIndex() || IsBuildVectorIndex();
     }
 
     bool IsBuildColumns() const {
@@ -3637,6 +3681,10 @@ public:
 
     bool IsFinished() const {
         return IsDone() || IsCancelled();
+    }
+
+    bool IsValidatingUniqueIndex() const {
+        return SubState == ESubState::UniqIndexValidation;
     }
 
     void AddNotifySubscriber(const TActorId& actorID) {
@@ -3764,8 +3812,19 @@ struct TSysViewInfo : TSimpleRefCount<TSysViewInfo> {
 };
 
 struct TIncrementalRestoreState {
-    TPathId BackupCollectionPathId;
-    ui64 OriginalOperationId;
+    enum class EState : ui32 {
+        Running = 1,
+        Finalizing = 2,
+        Completed = 3,
+    };
+
+    EState State = EState::Running;
+
+    // The backup collection path this restore belongs to
+    TPathId BackupCollectionPathId; // used for DB scoping and finalization
+
+    // Global id of the original incremental restore operation
+    ui64 OriginalOperationId = 0;
 
     // Sequential incremental backup processing
     struct TIncrementalBackup {
@@ -3810,6 +3869,8 @@ struct TIncrementalRestoreState {
     // Table operation state tracking for DataShard completion
     THashMap<TOperationId, TTableOperationState> TableOperations;
 
+    THashSet<TShardIdx> InvolvedShards;
+
     bool AllIncrementsProcessed() const {
         return CurrentIncrementalIdx >= IncrementalBackups.size();
     }
@@ -3845,6 +3906,7 @@ struct TIncrementalRestoreState {
             InProgressOperations.clear();
             CompletedOperations.clear();
             TableOperations.clear();
+            // Note: We don't clear InvolvedShards as it accumulates across all incrementals
         }
     }
 
@@ -3989,6 +4051,7 @@ Y_DECLARE_OUT_SPEC(inline, NKikimr::NSchemeShard::TIndexBuildInfo, o, info) {
     }
 
     o << ", State: " << info.State;
+    o << ", SubState: " << info.SubState;
     o << ", IsBroken: " << info.IsBroken;
     o << ", IsCancellationRequested: " << info.CancelRequested;
 
@@ -4014,6 +4077,10 @@ Y_DECLARE_OUT_SPEC(inline, NKikimr::NSchemeShard::TIndexBuildInfo, o, info) {
     o << ", ApplyTxId: " << info.ApplyTxId;
     o << ", ApplyTxStatus: " << NKikimrScheme::EStatus_Name(info.ApplyTxStatus);
     o << ", ApplyTxDone: " << info.ApplyTxDone;
+
+    o << ", DropColumnsTxId: " << info.DropColumnsTxId;
+    o << ", DropColumnsTxStatus: " << NKikimrScheme::EStatus_Name(info.DropColumnsTxStatus);
+    o << ", DropColumnsTxDone: " << info.DropColumnsTxDone;
 
     o << ", UnlockTxId: " << info.UnlockTxId;
     o << ", UnlockTxStatus: " << NKikimrScheme::EStatus_Name(info.UnlockTxStatus);

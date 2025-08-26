@@ -199,6 +199,9 @@ public:
                 if (info.tabletbootmode() != NKikimrHive::TABLET_BOOT_MODE_DEFAULT) {
                     return state;
                 }
+                if (info.has_lockedtoactor()) {
+                    return state;
+                }
                 if (info.lastalivetimestamp() != 0 && TInstant::MilliSeconds(info.lastalivetimestamp()) < settings.AliveBarrier) {
                     // Tablet is not alive for a long time
                     // We should report it as dead unless it's just waiting to be created
@@ -379,7 +382,7 @@ public:
                 }
                 std::sort(reason.begin(), reason.end());
                 reason.erase(std::unique(reason.begin(), reason.end()), reason.end());
-                TIssueRecord& issueRecord(*IssueRecords.emplace(IssueRecords.begin()));
+                TIssueRecord& issueRecord(*IssueRecords.emplace(IssueRecords.end()));
                 Ydb::Monitoring::IssueLog& issueLog(issueRecord.IssueLog);
                 issueLog.set_status(status);
                 issueLog.set_message(message);
@@ -1110,10 +1113,59 @@ public:
     }
 
     template<typename TEvent>
-    [[nodiscard]] TRequestResponse<typename WhiteboardResponse<TEvent>::Type> RequestNodeWhiteboard(TNodeId nodeId, std::initializer_list<int> fields = {}) {
+    std::vector<int> GetRequiredFields();
+
+    template<>
+    std::vector<int> GetRequiredFields<TEvWhiteboard::TEvSystemStateRequest>() {
+        return {
+                NKikimrWhiteboard::TSystemStateInfo::kPoolStatsFieldNumber,
+                NKikimrWhiteboard::TSystemStateInfo::kLoadAverageFieldNumber,
+                NKikimrWhiteboard::TSystemStateInfo::kNumberOfCpusFieldNumber,
+                NKikimrWhiteboard::TSystemStateInfo::kMaxClockSkewPeerIdFieldNumber,
+                NKikimrWhiteboard::TSystemStateInfo::kLocationFieldNumber,
+                NKikimrWhiteboard::TSystemStateInfo::kMaxClockSkewWithPeerUsFieldNumber,
+            };
+    }
+
+    template<>
+    std::vector<int> GetRequiredFields<TEvWhiteboard::TEvVDiskStateRequest>() {
+        return {
+                NKikimrWhiteboard::TVDiskStateInfo::kVDiskIdFieldNumber,
+                NKikimrWhiteboard::TVDiskStateInfo::kPDiskIdFieldNumber,
+                NKikimrWhiteboard::TVDiskStateInfo::kVDiskStateFieldNumber,
+                NKikimrWhiteboard::TVDiskStateInfo::kReplicatedFieldNumber,
+                NKikimrWhiteboard::TVDiskStateInfo::kDiskSpaceFieldNumber,
+        };
+    }
+
+    template<>
+    std::vector<int> GetRequiredFields<TEvWhiteboard::TEvPDiskStateRequest>() {
+        return {
+                NKikimrWhiteboard::TPDiskStateInfo::kPDiskIdFieldNumber,
+                NKikimrWhiteboard::TPDiskStateInfo::kPathFieldNumber,
+                NKikimrWhiteboard::TPDiskStateInfo::kAvailableSizeFieldNumber,
+                NKikimrWhiteboard::TPDiskStateInfo::kTotalSizeFieldNumber,
+                NKikimrWhiteboard::TPDiskStateInfo::kStateFieldNumber,
+        };
+    }
+
+    template<>
+    std::vector<int> GetRequiredFields<TEvWhiteboard::TEvBSGroupStateRequest>() {
+        return {
+                NKikimrWhiteboard::TBSGroupStateInfo::kGroupGenerationFieldNumber,
+                NKikimrWhiteboard::TBSGroupStateInfo::kGroupIDFieldNumber,
+                NKikimrWhiteboard::TBSGroupStateInfo::kStoragePoolNameFieldNumber,
+                NKikimrWhiteboard::TBSGroupStateInfo::kBridgePileIdFieldNumber,
+                NKikimrWhiteboard::TBSGroupStateInfo::kErasureSpeciesFieldNumber,
+                NKikimrWhiteboard::TBSGroupStateInfo::kVDiskIdsFieldNumber,
+        };
+    }
+
+    template<typename TEvent>
+    [[nodiscard]] TRequestResponse<typename WhiteboardResponse<TEvent>::Type> RequestNodeWhiteboard(TNodeId nodeId) {
         TActorId whiteboardServiceId = MakeNodeWhiteboardServiceId(nodeId);
         auto request = MakeHolder<TEvent>();
-        for (int field : fields) {
+        for (int field : GetRequiredFields<TEvent>()) {
             request->Record.AddFieldsRequired(field);
         }
         TRequestResponse<typename WhiteboardResponse<TEvent>::Type> response(Span.CreateChild(TComponentTracingLevels::TTablet::Detailed, TypeName(*request.Get())));
@@ -1125,9 +1177,10 @@ public:
         return response;
     }
 
+
     void RequestGenericNode(TNodeId nodeId) {
         if (NodeSystemState.count(nodeId) == 0) {
-            NodeSystemState.emplace(nodeId, RequestNodeWhiteboard<TEvWhiteboard::TEvSystemStateRequest>(nodeId, {-1}));
+            NodeSystemState.emplace(nodeId, RequestNodeWhiteboard<TEvWhiteboard::TEvSystemStateRequest>(nodeId));
             ++Requests;
         }
     }
@@ -1187,7 +1240,7 @@ public:
             case TEvWhiteboard::EvSystemStateRequest: {
                 auto& request = NodeSystemState[nodeId];
                 if (!request.IsOk()) {
-                    request = RequestNodeWhiteboard<TEvWhiteboard::TEvSystemStateRequest>(nodeId, {-1});
+                    request = RequestNodeWhiteboard<TEvWhiteboard::TEvSystemStateRequest>(nodeId);
                 }
                 break;
             }
@@ -2759,6 +2812,11 @@ public:
             context.Location.mutable_storage()->mutable_pool()->mutable_group()->add_id();
         }
         context.Location.mutable_storage()->mutable_pool()->mutable_group()->set_id(0, ToString(groupId));
+        if (groupInfo.HasBridgePileId() && NodeWardenStorageConfig && NodeWardenStorageConfig->Get()->BridgeInfo) {
+            const auto& pileId = TBridgePileId::FromProto(&groupInfo, &NKikimrWhiteboard::TBSGroupStateInfo::GetBridgePileId);
+            const auto& pile = NodeWardenStorageConfig->Get()->BridgeInfo->GetPile(pileId)->Name;
+            context.Location.mutable_storage()->mutable_pool()->mutable_group()->mutable_pile()->set_name(pile);
+        }
         storageGroupStatus.set_id(ToString(groupId));
         TGroupChecker checker(groupInfo.erasurespecies());
         for (const auto& protoVDiskId : groupInfo.vdiskids()) {
@@ -2803,10 +2861,12 @@ public:
     struct TMergeIssuesContext {
         std::unordered_map<ETags, TList<TSelfCheckContext::TIssueRecord>> recordsMap;
         std::unordered_set<TString> removeIssuesIds;
+        std::unordered_map<TString, TSelfCheckContext::TIssueRecord*> issueById;
 
         TMergeIssuesContext(TList<TSelfCheckContext::TIssueRecord>& records) {
             for (auto it = records.begin(); it != records.end(); ) {
                 auto move = it++;
+                issueById.emplace(move->IssueLog.id(), &(*move));
                 recordsMap[move->Tag].splice(recordsMap[move->Tag].end(), records, move);
             }
         }
@@ -2858,10 +2918,11 @@ public:
         }
 
         void RenameMergingIssues(TList<TSelfCheckContext::TIssueRecord>& records) {
-            for (auto it = records.begin(); it != records.end(); it++) {
+            for (auto it = records.rbegin(); it != records.rend(); it++) {
+                auto message = it->IssueLog.message();
                 if (it->IssueLog.count() > 0) {
-                    TString message = it->IssueLog.message();
                     switch (it->Tag) {
+                        case ETags::BridgeGroupState:
                         case ETags::GroupState: {
                             message = std::regex_replace(message.c_str(), std::regex("^Group has "), "Groups have ");
                             message = std::regex_replace(message.c_str(), std::regex("^Group is "), "Groups are ");
@@ -2883,8 +2944,28 @@ public:
                         default:
                             break;
                     }
-                    it->IssueLog.set_message(message);
                 }
+                if (IsBridgeMode(TActivationContext::AsActorContext()) && it->Tag == ETags::GroupState) {
+                    if (it->IssueLog.reason_size() == 1) {
+                        const auto& reason = issueById[it->IssueLog.reason(0)]->IssueLog;
+                        if (message.find("in pile") == std::string::npos) {
+                            message = TStringBuilder() << reason.message() <<  " in pile " << reason.location().storage().pool().group().pile().name();
+                        }
+                        it->IssueLog.mutable_location()->mutable_storage()->mutable_pool()->mutable_group()->mutable_pile()->CopyFrom(reason.location().storage().pool().group().pile());
+                    }
+                }
+                if (IsBridgeMode(TActivationContext::AsActorContext()) && (it->Tag == ETags::PoolState || it->Tag == ETags::StorageState)) {
+                    auto reasonPiles = it->IssueLog.reason() | std::views::transform([this](auto&& reason) {return issueById[reason]->IssueLog.location().storage().pool().group().pile().name();});
+                    std::unordered_set<TString> piles(reasonPiles.begin(), reasonPiles.end());;
+                    if (piles.size() == 1 && !piles.begin()->empty()) {
+                        TString pile = *piles.begin();
+                        if (message.find("in pile") == std::string::npos) {
+                            message = TStringBuilder() << message << " in pile " << pile;
+                        }
+                        it->IssueLog.mutable_location()->mutable_storage()->mutable_pool()->mutable_group()->mutable_pile()->set_name(pile);
+                    }
+                }
+                it->IssueLog.set_message(message);
             }
         }
 
@@ -3175,8 +3256,6 @@ public:
             }
         }
 
-        MergeRecords(context.IssueRecords);
-
         switch (context.GetOverallStatus()) {
             case Ydb::Monitoring::StatusFlag::BLUE:
             case Ydb::Monitoring::StatusFlag::YELLOW:
@@ -3246,6 +3325,7 @@ public:
             }
         }
         storageStatus.set_overall(context.GetOverallStatus());
+        MergeRecords(context.IssueRecords);
     }
 
     struct TOverallStateContext {
@@ -3436,6 +3516,10 @@ public:
         Ydb::Monitoring::SelfCheckResult& result = response->Result;
 
         FillNodeInfo(SelfId().NodeId(), result.mutable_location());
+        if (NodeWardenStorageConfig && NodeWardenStorageConfig->Get()->BridgeInfo) {
+            const auto& selfPileName = NodeWardenStorageConfig->Get()->BridgeInfo->SelfNodePile->Name;
+            result.mutable_location()->mutable_pile()->set_name(selfPileName);
+        }
 
         auto byteSize = result.ByteSizeLong();
         auto byteLimit = 50_MB - 1_KB; // 1_KB - for HEALTHCHECK STATUS issue going last
