@@ -101,8 +101,8 @@ public:
                 auto readConfig = NSo::ParseSolomonReadActorConfig(source.settings());
 
                 auto solomonClient = NSo::ISolomonAccessorClient::Make(std::move(source), credentialsProvider, readConfig);
-                auto labelNamesFuture = solomonClient->GetLabelNames(selectors, from, to);
-                auto listMetricsLabelsFuture = solomonClient->ListMetricsLabels(selectors, from, to);
+                auto labelNamesFuture = solomonClient->GetLabelNames(selectors, {from, to});
+                auto listMetricsLabelsFuture = solomonClient->ListMetricsLabels(selectors, {from, to});
 
                 LabelNamesRequests_[soReadObject.Raw()] = {
                     .SolomonClient = solomonClient,

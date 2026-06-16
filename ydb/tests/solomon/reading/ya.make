@@ -7,6 +7,7 @@ TEST_SRCS(
     backpressure_test.py
     base.py
     basic_reading.py
+    data_batching.py
     data_paging.py
     listing_batching.py
     listing_paging.py

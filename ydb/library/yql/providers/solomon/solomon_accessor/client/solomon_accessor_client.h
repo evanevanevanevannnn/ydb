@@ -20,12 +20,12 @@ public:
         const TSolomonReadActorConfig& cfg);
     
 public:
-    virtual NThreading::TFuture<TGetLabelsResponse> GetLabelNames(const TSelectors& selectors, TInstant from, TInstant to) const = 0;
-    virtual NThreading::TFuture<TListMetricsResponse> ListMetrics(const TSelectors& selectors, TInstant from, TInstant to) const = 0;
-    virtual NThreading::TFuture<TListMetricsLabelsResponse> ListMetricsLabels(const TSelectors& selectors, TInstant from, TInstant to) const = 0;
-    virtual NThreading::TFuture<TGetPointsCountResponse> GetPointsCount(const TSelectors& selectors, TInstant from, TInstant to) const = 0;
-    virtual NThreading::TFuture<TGetDataResponse> GetData(const TSelectors& selectors, TInstant from, TInstant to) const = 0;
-    virtual NThreading::TFuture<TGetDataResponse> GetData(const TString& program, TInstant from, TInstant to) const = 0;
+    virtual NThreading::TFuture<TGetLabelsResponse> GetLabelNames(const TSelectors& selectors, TTimeRange range) const = 0;
+    virtual NThreading::TFuture<TListMetricsResponse> ListMetrics(const TSelectors& selectors, TTimeRange range) const = 0;
+    virtual NThreading::TFuture<TListMetricsLabelsResponse> ListMetricsLabels(const TSelectors& selectors, TTimeRange range) const = 0;
+    virtual NThreading::TFuture<TGetPointsCountResponse> GetPointsCount(const TSelectors& selectors, TTimeRange range) const = 0;
+    virtual NThreading::TFuture<TGetDataResponse> GetData(const std::vector<TSelectors>& selectorsBatch, TTimeRange range) const = 0;
+    virtual NThreading::TFuture<TGetDataResponse> GetData(const TString& program, TTimeRange range) const = 0;
 };
 
 } // namespace NYql::NSo

@@ -8,6 +8,7 @@
 #include <util/string/join.h>
 #include <ydb/library/yql/dq/actors/common/retry_queue.h>
 #include <ydb/library/yql/providers/solomon/actors/dq_solomon_metrics_queue.h>
+#include <ydb/library/yql/providers/solomon/common/constants.h>
 #include <ydb/library/yql/providers/solomon/events/events.h>
 #include <ydb/library/yql/providers/solomon/scheme/yql_solomon_scheme.h>
 #include <ydb/library/yql/providers/solomon/solomon_accessor/client/solomon_accessor_client.h>
@@ -43,6 +44,11 @@
 #include <util/generic/size_literals.h>
 #include <util/system/compiler.h>
 
+#include <map>
+#include <set>
+#include <unordered_map>
+#include <vector>
+
 #define SOURCE_LOG_T(s) \
     LOG_TRACE_S(*NActors::TlsActivationContext, NKikimrServices::KQP_COMPUTE, LogPrefix << s)
 #define SOURCE_LOG_D(s) \
@@ -70,18 +76,40 @@ namespace {
 
 class TDqSolomonReadActor : public NActors::TActorBootstrapped<TDqSolomonReadActor>, public IDqComputeActorAsyncInput {
 private:
-    struct TSizedTimeseries {
-        NSo::TTimeseries Timeseries;
-        ui64 TotalSize;
-
-        explicit TSizedTimeseries(NSo::TTimeseries&& ts)
-            : Timeseries(std::move(ts)) {
-            TotalSize = Timeseries.Timestamps.size() * 8 + Timeseries.Values.size() * 8;
-            TotalSize += Timeseries.Metric.Type.size();
-            for (const auto& [key, value]: Timeseries.Metric.Selectors) {
-                TotalSize += key.size() + value.Value.size();
+    class TSizedSelectors {
+    public:
+        TSizedSelectors() {}
+        TSizedSelectors(NSo::TSelectors&& selectors)
+            : Selectors(std::move(selectors)) {
+            for (const auto& [key, selector] : Selectors) {
+                TotalSize += key.size() + selector.Op.size() + selector.Value.size();
             }
         }
+
+        operator NSo::TSelectors() const {
+            return Selectors;
+        }
+
+    public:
+        NSo::TSelectors Selectors;
+        ui64 TotalSize = 0;
+    };
+
+    class TSizedTimeseries {
+    public:
+        TSizedTimeseries(NSo::TTimeseries&& timeseries)
+            : Timeseries(std::move(timeseries)) {
+            for (const auto& [key, selector] : Timeseries.Metric.Selectors) {
+                TotalSize += key.size() + selector.Op.size() + selector.Value.size();
+            }
+            TotalSize += Timeseries.Metric.Type.size();
+            TotalSize += Timeseries.Timestamps.size() * sizeof(int64_t);
+            TotalSize += Timeseries.Values.size() * sizeof(double);
+        }
+
+    public:
+        NSo::TTimeseries Timeseries;
+        ui64 TotalSize = 0;
     };
 
 public:
@@ -110,13 +138,14 @@ public:
         , LogPrefix(TStringBuilder() << "TxId: " << TxId << ", TDqSolomonReadActor: ")
         , ReadParams(std::move(readParams))
         , ComputeActorBatchSize(cfg.ComputeActorBatchSize)
-        , TrueRangeFrom(TInstant::Seconds(ReadParams.Source.GetFrom()) - TDuration::Seconds(cfg.TruePointsFindRangeSec))
-        , TrueRangeTo(TInstant::Seconds(ReadParams.Source.GetTo()) + TDuration::Seconds(cfg.TruePointsFindRangeSec))
         , MetricsQueueConsumersCountDelta(metricsQueueConsumersCountDelta)
         , MaxApiInflight(cfg.MaxApiInflight)
-        , MaxDataInflightBytes(cfg.MaxDataInflightBytes)
-        , MaxMetadataInflightBytes(cfg.MaxMetadataInflightBytes)
+        , MaxDataInflightBytes(cfg.MaxDataInflightMb * 1_MB)
+        , MaxMetadataInflightBytes(cfg.MaxMetadataInflightMb * 1_MB)
         , MaxPointsPerOneRequest(cfg.MaxPointsPerOneRequest)
+        , MaxSelectorsPerBatch(cfg.MaxSelectorsPerBatch)
+        , TruePointsFindRangeSec(cfg.TruePointsFindRangeSec)
+        , DownsamplingEnabled(!ReadParams.Source.GetDownsampling().GetDisabled())
         , MetricsQueueActor(metricsQueueActor)
         , MemoryQuotaManager(memoryQuotaManager)
         , CredentialsProvider(credentialsProvider)
@@ -143,19 +172,37 @@ public:
 
         UseMetricsQueue = ReadParams.Source.HasSelectors();
 
-        auto stringType = ProgramBuilder.NewDataType(NYql::NUdf::TDataType<char*>::Id);
-        DictType = ProgramBuilder.NewDictType(stringType, stringType, false);
+        if (!UseMetricsQueue) {
+            // Limited mode: a single user-provided program over the full range.
+            // It is not split into sub-ranges (we do not know the point count
+            // for an arbitrary program). Issue exactly one data request.
+            TDataRequest req;
+            req.RequestId = ++NextRequestId;
+            req.Range = {
+                TInstant::Seconds(ReadParams.Source.GetFrom()),
+                TInstant::Seconds(ReadParams.Source.GetTo()),
+            };
+            req.Program = ReadParams.Source.GetProgram();
+            req.InflightBytes = 0;
+            req.State = RetryPolicy->CreateRetryState();
 
-        FillSystemColumnPositionIndex();
+            PendingDataRequests[req.RequestId] = std::move(req);
+
+            ListedTimeRanges = 1;
+        }
+
+        FillSystemFields();
     }
 
-    void FillSystemColumnPositionIndex() {
+    void FillSystemFields() {
         YQL_ENSURE(ReadParams.Source.GetLabelNameAliases().size() == ReadParams.Source.GetLabelNames().size());
 
+        // AliasIndex
         for (int i = 0; i < ReadParams.Source.GetLabelNameAliases().size(); ++i) {
             AliasIndex[ReadParams.Source.GetLabelNameAliases()[i]] = ReadParams.Source.GetLabelNames()[i];
         }
 
+        // Index
         std::vector<TString> names(ReadParams.Source.GetSystemColumns().begin(), ReadParams.Source.GetSystemColumns().end());
         names.insert(names.end(), ReadParams.Source.GetLabelNameAliases().begin(), ReadParams.Source.GetLabelNameAliases().end());
         std::sort(names.begin(), names.end());
@@ -163,9 +210,52 @@ public:
         for (auto& n : names) {
             Index[n] = index++;
         }
+
+        // SharedRanges
+        const TInstant extendedFrom = TInstant::Seconds(ReadParams.Source.GetFrom()) - TDuration::Seconds(TruePointsFindRangeSec);
+        const TInstant extendedTo = TInstant::Seconds(ReadParams.Source.GetTo()) + TDuration::Seconds(TruePointsFindRangeSec);
+        const TInstant cutoff = TInstant::Now() - NSo::NConstants::DownsamplingCutoff;
+        const TInstant historicalEnd = std::min(std::max(cutoff, extendedFrom), extendedTo);
+        
+        NonDownsampledRange = {historicalEnd, extendedTo};
+
+        if (extendedFrom < historicalEnd) {
+            auto ranges = SplitDownsampledRange({extendedFrom, historicalEnd}, NSo::NConstants::DefaultGridInterval.MilliSeconds());
+            SharedRanges.insert(SharedRanges.end(), ranges.begin(), ranges.end());
+        }
+
+        if (historicalEnd < extendedTo && DownsamplingEnabled) {
+            const ui64 userGridMs = ReadParams.Source.GetDownsampling().GetGridMs();
+            auto ranges = SplitDownsampledRange({historicalEnd,extendedTo}, userGridMs);
+            SharedRanges.insert(SharedRanges.end(), ranges.begin(), ranges.end());
+        }
+
+
+        // Precomputed types
+        auto stringType = ProgramBuilder.NewDataType(NYql::NUdf::TDataType<char*>::Id);
+        DictType = ProgramBuilder.NewDictType(stringType, stringType, false);
+
+        // [DIAG] Log config and time-range split summary
+        SOURCE_LOG_I("[DIAG] Config: downsamplingEnabled=" << DownsamplingEnabled
+            << ", MaxApiInflight=" << MaxApiInflight
+            << ", MaxSelectorsPerBatch=" << MaxSelectorsPerBatch
+            << ", MaxPointsPerOneRequest=" << MaxPointsPerOneRequest
+            << ", MaxDataInflightBytes=" << MaxDataInflightBytes
+            << ", TruePointsFindRangeSec=" << TruePointsFindRangeSec);
+        SOURCE_LOG_I("[DIAG] TimeRanges: SharedRanges=" << SharedRanges.size() << " sub-ranges"
+            << ", NonDownsampledRange=[" << NonDownsampledRange.From << ".." << NonDownsampledRange.To << ")"
+            << ", queryRange=[" << TInstant::Seconds(ReadParams.Source.GetFrom()) << ".." << TInstant::Seconds(ReadParams.Source.GetTo()) << ")"
+            << ", extendedRange=[" << extendedFrom << ".." << extendedTo << ")");
+        for (size_t i = 0; i < SharedRanges.size(); ++i) {
+            SOURCE_LOG_I("[DIAG]   SharedRange[" << i << "]: ["
+                << SharedRanges[i].first.From << ".." << SharedRanges[i].first.To << ")"
+                << ", estimatedPoints=" << SharedRanges[i].second);
+        }
     }
 
     void Bootstrap() {
+        SOURCE_LOG_D("Bootstrap");
+        
         if (!MemoryQuotaManager->AllocateQuota(MaxDataInflightBytes + MaxMetadataInflightBytes)) {
             TIssues issues;
             issues.AddIssue(TIssue{TStringBuilder() << "OutOfMemory - can't allocate " << MaxDataInflightBytes + MaxMetadataInflightBytes << "b read buffer"});
@@ -185,20 +275,13 @@ public:
             RequestMetrics();
         } else {
             Become(&TDqSolomonReadActor::LimitedModeState);
-
-            NSo::TMetricTimeRange metric {
-                {},
-                ReadParams.Source.GetProgram(),
-                TInstant::Seconds(ReadParams.Source.GetFrom()),
-                TInstant::Seconds(ReadParams.Source.GetTo())
-            };
-
-            CurrentMetadataBytes += EstimateMetricTimeRangeBytes(metric);
-            MetricsWithTimeRange.push_back(std::move(metric));
-            RequestData();
+            SendDataRequest(PendingDataRequests.begin()->first);
         }
 
         Bootstrapped = true;
+
+        // [DIAG] Log bootstrap mode
+        SOURCE_LOG_I("[DIAG] Bootstrap: mode=" << (UseMetricsQueue ? "limitless(selectors)" : "limited(program)"));
     }
     
     STRICT_STFUNC(LimitlessModeState,
@@ -243,16 +326,26 @@ public:
         auto& listedMetrics = batch.GetMetrics();
 
         SOURCE_LOG_D("HandleMetricsBatch batch of size " << listedMetrics.size());
-        for (const auto& metric : listedMetrics) {
-            NSo::TSelectors selectors;
-            NSo::ProtoToSelectors(metric.GetSelectors(), selectors);
-            NSo::TMetric m{std::move(selectors), metric.GetType()};
-            CurrentMetadataBytes += EstimateMetricBytes(m);
-            ListedMetrics.emplace_back(std::move(m));
-        }
         ListedMetricsCount += listedMetrics.size();
 
-        while (TryRequestPointsCount()) {}
+        for (const auto& metric : listedMetrics) {
+            TSizedSelectors selectors(NSo::ProtoToSelectors(metric.GetSelectors()));
+
+            for (const auto& [range, pointsCount] : SharedRanges) {
+                PendingByRange[range].push_back({selectors, pointsCount});
+                CurrentMetadataBytes += selectors.TotalSize;
+                ListedTimeRanges++;
+            }
+
+            if (DownsamplingEnabled || NonDownsampledRange.From == NonDownsampledRange.To) {
+                CompletedMetricsCount++;
+            } else {
+                CurrentMetadataBytes += selectors.TotalSize;
+                ListedMetrics.emplace_back(std::move(selectors));
+            }
+        }
+
+        while (TryRequestData()) {}
 
         if (LastMetricProcessed()) {
             NotifyComputeActorWithData();
@@ -280,8 +373,10 @@ public:
     void HandlePointsCountBatch(TEvSolomonProvider::TEvPointsCountBatch::TPtr& pointsCountBatch) {
         auto& batch = *pointsCountBatch->Get();
 
-        const ui64 metricBytes = EstimateMetricBytes(batch.Metric);
-        CurrentPointsCountBytesInflight -= std::min(CurrentPointsCountBytesInflight, metricBytes);
+        auto pendingIt = PendingPointsCountRequests.find(batch.RequestId);
+        YQL_ENSURE(pendingIt != PendingPointsCountRequests.end());
+
+        const auto& request = pendingIt->second;
 
         if (batch.Response.Status != NSo::EStatus::STATUS_OK) {
             TIssues issues { TIssue(batch.Response.Error) };
@@ -294,10 +389,18 @@ public:
         IngressStats.Chunks++;
         IngressStats.Resume();
 
-        auto& metric = batch.Metric;
+        auto& selectors = request.Selectors;
         auto& pointsCount = batch.Response.Result.PointsCount;
-        ParsePointsCount(metric, pointsCount);
+        
+        auto ranges = NSo::SplitIntoRanges(NonDownsampledRange, pointsCount, MaxPointsPerOneRequest);
+        for (const auto& [range, pointsCount] : ranges) {
+            PendingByRange[range].push_back({selectors, pointsCount});
+            CurrentMetadataBytes += selectors.TotalSize;
+            ListedTimeRanges++;
+        }
+
         CompletedMetricsCount++;
+        PendingPointsCountRequests.erase(pendingIt);
 
         while (TryRequestData()) {}
     }
@@ -307,37 +410,19 @@ public:
             return;
         }
 
-        if (!MetricsWithTimeRange.empty()) {
-            TryRequestData();
+        if (!PendingByRange.empty()) {
+            while (TryRequestData()) {}
         }
-        if (MetricsData.size() >= ComputeActorBatchSize || LastMetricProcessed()) {
+        if (MetricsData.size() >= ComputeActorBatchSize
+            || CurrentDataBytesStored > MaxDataInflightBytes
+            || LastMetricProcessed())
+        {
             NotifyComputeActorWithData();
         }
     }
 
     void HandleRetryDataRequest(TEvSolomonProvider::TEvRetryDataRequest::TPtr& retryDataRequest) {
-        auto& retryDataEvent = *retryDataRequest->Get();
-        NThreading::TFuture<NSo::TGetDataResponse> dataRequestFuture;
-        
-        auto request = std::move(retryDataEvent.Request);
-        try {
-            if (UseMetricsQueue) {
-                dataRequestFuture = SolomonClient->GetData(request.Selectors, request.From, request.To);
-            } else {
-                dataRequestFuture = SolomonClient->GetData(request.Program, request.From, request.To);
-            }
-        } catch (const std::exception& ex) {
-            dataRequestFuture = NThreading::MakeFuture(NSo::TGetDataResponse(TString(ex.what())));
-        }
-
-        dataRequestFuture.Subscribe([request = std::move(request), actorSystem = TActivationContext::ActorSystem(), selfId = SelfId()](
-            NThreading::TFuture<NSo::TGetDataResponse> response) mutable -> void
-        {
-            actorSystem->Send(selfId, new TEvSolomonProvider::TEvNewDataBatch(
-                response.ExtractValue(),
-                std::move(request)
-            ));
-        });
+        SendDataRequest(std::move(retryDataRequest->Get()->RequestId));
     }
 
     void Handle(TEvSolomonProvider::TEvAck::TPtr& ev) {
@@ -372,7 +457,12 @@ public:
             return;
         }
 
-        NotifyComputeActorWithData();
+        if (MetricsData.size() >= ComputeActorBatchSize
+            || CurrentDataBytesStored > MaxDataInflightBytes
+            || LastMetricProcessed())
+        {
+            NotifyComputeActorWithData();
+        }
     }
 
     i64 GetAsyncInputData(TUnboxedValueBatch& buffer, TMaybe<TInstant>&, bool& finished, i64) final {
@@ -469,6 +559,24 @@ private:
     // IActor & IDqComputeActorAsyncInput
     void PassAway() override { // Is called from Compute Actor
         SOURCE_LOG_I("PassAway, processed " << CompletedMetricsCount << " metrics, " << CompletedTimeRanges << " time ranges.");
+        // [DIAG] Final batching efficiency summary
+        {
+            const double avgPoints = DiagTotalDataRequests > 0
+                ? static_cast<double>(DiagTotalPointsReturned) / DiagTotalDataRequests : 0;
+            const double avgSelectors = DiagTotalDataRequests > 0
+                ? static_cast<double>(DiagTotalSelectorsInRequests) / DiagTotalDataRequests : 0;
+            SOURCE_LOG_N("[DIAG] SUMMARY: totalDataRequests=" << DiagTotalDataRequests
+                << ", totalPointsReturned=" << DiagTotalPointsReturned
+                << ", avgPointsPerRequest=" << avgPoints
+                << ", minPointsPerRequest=" << (DiagMinPointsPerRequest == Max<ui64>() ? 0 : DiagMinPointsPerRequest)
+                << ", maxPointsPerRequest=" << DiagMaxPointsPerRequest
+                << ", avgSelectorsPerRequest=" << avgSelectors
+                << ", minSelectorsPerRequest=" << (DiagMinSelectorsPerRequest == Max<ui64>() ? 0 : DiagMinSelectorsPerRequest)
+                << ", maxSelectorsPerRequest=" << DiagMaxSelectorsPerRequest
+                << ", listedMetrics=" << ListedMetricsCount
+                << ", completedTimeRanges=" << CompletedTimeRanges << "/" << ListedTimeRanges
+                << ", sharedRangesCount=" << SharedRanges.size());
+        }
         if (Bootstrapped) {
             if (UseMetricsQueue) {
                 if (!IsConfirmedMetricsQueueFinish) {
@@ -505,13 +613,17 @@ private:
         if (UseMetricsQueue) {
             return IsMetricsQueueEmpty && CompletedMetricsCount == ListedMetricsCount && CompletedTimeRanges == ListedTimeRanges;
         }
-        return CompletedTimeRanges == 1;
+        return CompletedTimeRanges == ListedTimeRanges;
     }
 
     void TryRequestMetrics() {
-        if (ListedMetrics.empty() && !IsMetricsQueueEmpty && !IsWaitingMetricsQueueResponse) {
-            RequestMetrics();
+        if (IsMetricsQueueEmpty || IsWaitingMetricsQueueResponse) {
+            return;
         }
+        if (CurrentMetadataBytes >= MaxMetadataInflightBytes) {
+            return;
+        }
+        RequestMetrics();
     }
 
     void RequestMetrics() {
@@ -526,7 +638,7 @@ private:
             return false;
         }
 
-        if (CurrentMetadataBytes + CurrentPointsCountBytesInflight >= MaxMetadataInflightBytes) {
+        if (CurrentMetadataBytes >= MaxMetadataInflightBytes) {
             return false;
         }
 
@@ -535,50 +647,48 @@ private:
     }
 
     void RequestPointsCount() {
-        NSo::TMetric requestMetric = std::move(ListedMetrics.back());
+        TPointsCountRequest req;
+        req.RequestId = ++NextRequestId;
+        req.Selectors = std::move(ListedMetrics.back());
         ListedMetrics.pop_back();
 
-        const ui64 metricBytes = EstimateMetricBytes(requestMetric);
-        CurrentMetadataBytes -= std::min(CurrentMetadataBytes, metricBytes);
-        CurrentPointsCountBytesInflight += metricBytes;
+        CurrentMetadataBytes -= std::min(CurrentMetadataBytes, req.Selectors.TotalSize);
 
-        auto getPointsCountFuture = SolomonClient->GetPointsCount(requestMetric.Selectors, TrueRangeFrom, TrueRangeTo);
+        auto getPointsCountFuture = SolomonClient->GetPointsCount(req.Selectors, NonDownsampledRange);
 
         NActors::TActorSystem* actorSystem = NActors::TActivationContext::ActorSystem();
-        getPointsCountFuture.Subscribe([actorSystem, metric = std::move(requestMetric), selfId = SelfId()](
-            const NThreading::TFuture<NSo::TGetPointsCountResponse>& response) mutable -> void
+        getPointsCountFuture.Subscribe([actorSystem, requestId = req.RequestId, selfId = SelfId()](
+        const NThreading::TFuture<NSo::TGetPointsCountResponse>& response) mutable -> void
         {
             actorSystem->Send(selfId, new TEvSolomonProvider::TEvPointsCountBatch(
-                std::move(metric),
-                response.GetValue())
-            );
+                response.GetValue(),
+                requestId
+            ));
         });
+
+        PendingPointsCountRequests[req.RequestId] = std::move(req);
     }
 
-    static ui64 EstimateSelectorsBytes(const NSo::TSelectors& selectors) {
-        ui64 bytes = 0;
-        for (const auto& [key, selector] : selectors) {
-            bytes += key.size() + selector.Op.size() + selector.Value.size();
+    // Returns the split for one grid-aligned half of the read window.
+    std::vector<std::pair<NSo::TTimeRange, ui64>> SplitDownsampledRange(NSo::TTimeRange range, ui64 gridMs) const {
+        ui64 totalPoints = 0;
+        if (gridMs > 0) {
+            totalPoints = static_cast<ui64>(
+                ceil((range.To - range.From).Seconds() * 1000.0 / gridMs)) + 1;
+        } else {
+            totalPoints = MaxPointsPerOneRequest;
         }
-        return bytes;
-    }
-
-    static ui64 EstimateMetricBytes(const NSo::TMetric& metric) {
-        return sizeof(NSo::TMetric) + EstimateSelectorsBytes(metric.Selectors) + metric.Type.size();
-    }
-
-    static ui64 EstimateMetricTimeRangeBytes(const NSo::TMetricTimeRange& range) {
-        return sizeof(NSo::TMetricTimeRange) + EstimateSelectorsBytes(range.Selectors) + range.Program.size();
-    }
-
-    static ui64 EstimateDataRequestBytes(const NSo::TMetricTimeRange& request, ui64 maxPointsPerRequest) {
-        return maxPointsPerRequest * (sizeof(int64_t) + sizeof(double)) + EstimateSelectorsBytes(request.Selectors);
+        return NSo::SplitIntoRanges(range, totalPoints, MaxPointsPerOneRequest);
     }
 
     bool TryRequestData() {
-        TryRequestPointsCount();
+        if (!DownsamplingEnabled) {
+            TryRequestPointsCount();
+        } else {
+            TryRequestMetrics();
+        }
 
-        if (MetricsWithTimeRange.empty()) {
+        if (PendingByRange.empty()) {
             return false;
         }
 
@@ -595,104 +705,116 @@ private:
     }
 
     void RequestData() {
+        YQL_ENSURE(!PendingByRange.empty());
         YQL_ENSURE(RetryPolicy);
-        NThreading::TFuture<NSo::TGetDataResponse> dataRequestFuture;
 
-        auto request = std::move(MetricsWithTimeRange.back());
-        MetricsWithTimeRange.pop_back();
+        auto bucketIt = PendingByRange.begin();
+        for (auto it = std::next(PendingByRange.begin()); it != PendingByRange.end(); ++it) {
+            if (it->second.size() > bucketIt->second.size()) {
+                bucketIt = it;
+            }
+        }
+        const NSo::TTimeRange range = bucketIt->first;
+        auto& bucket = bucketIt->second;
 
-        const ui64 rangeBytes = EstimateMetricTimeRangeBytes(request);
-        CurrentMetadataBytes -= std::min(CurrentMetadataBytes, rangeBytes);
+        TDataRequest req;
+        req.RequestId = ++NextRequestId;
+        req.Range = range;
+        req.SelectorsBatch.reserve(std::min<ui64>(bucket.size(), MaxSelectorsPerBatch));
+
+        // Take lines until any of the limits would be exceeded; always take at
+        // least one (Split guarantees per-line points <= MaxPointsPerOneRequest).
+        // Refund the metadata budget per entry as we move it out of the bucket.
+        ui64 takenPoints = 0;
+        while (!bucket.empty() && req.SelectorsBatch.size() < MaxSelectorsPerBatch) {
+            auto& [selectors, pointsCount] = bucket.back();
+            if (takenPoints + pointsCount > MaxPointsPerOneRequest)
+            {
+                break;
+            }
+            takenPoints += pointsCount;
+            CurrentMetadataBytes -= std::min(CurrentMetadataBytes, selectors.TotalSize);
+            req.SelectorsBatch.push_back(std::move(selectors));
+            bucket.pop_back();
+        }
+
+        if (bucket.empty()) {
+            PendingByRange.erase(bucketIt);
+        }
+
+        req.InflightBytes = takenPoints * (sizeof(int64_t) + sizeof(double));
+        req.State = RetryPolicy->CreateRetryState();
+
+        // [DIAG] Log per-request batching details
+        DiagTotalDataRequests++;
+        DiagTotalSelectorsInRequests += req.SelectorsBatch.size();
+        DiagMinSelectorsPerRequest = std::min(DiagMinSelectorsPerRequest, static_cast<ui64>(req.SelectorsBatch.size()));
+        DiagMaxSelectorsPerRequest = std::max(DiagMaxSelectorsPerRequest, static_cast<ui64>(req.SelectorsBatch.size()));
+        SOURCE_LOG_I("[DIAG] RequestData: reqId=" << req.RequestId
+            << ", range=[" << range.From << ".." << range.To << ")"
+            << ", durationSec=" << (range.To - range.From).Seconds()
+            << ", selectorsInBatch=" << req.SelectorsBatch.size()
+            << ", expectedPoints=" << takenPoints
+            << ", pendingBuckets=" << PendingByRange.size()
+            << ", currentInflight=" << CurrentDataInflight << "/" << MaxApiInflight);
+
+        PendingDataRequests[req.RequestId] = std::move(req);
+
+        SendDataRequest(req.RequestId);
+    }
+
+    void SendDataRequest(ui64 requestId) {
+        // Register a retry state by RequestId on the first attempt only.
+        auto pendingIt = PendingDataRequests.find(requestId);
+        YQL_ENSURE(pendingIt != PendingDataRequests.end());
+
+        const auto& request = pendingIt->second;
+
         CurrentDataInflight++;
-        CurrentDataBytesInflight += EstimateDataRequestBytes(request, MaxPointsPerOneRequest);
+        CurrentDataBytesInflight += request.InflightBytes;
 
+        NThreading::TFuture<NSo::TGetDataResponse> dataRequestFuture;
         try {
             if (UseMetricsQueue) {
-                dataRequestFuture = SolomonClient->GetData(request.Selectors, request.From, request.To);
+                dataRequestFuture = SolomonClient->GetData(request.SelectorsBatch, request.Range);
             } else {
-                dataRequestFuture = SolomonClient->GetData(request.Program, request.From, request.To);
+                dataRequestFuture = SolomonClient->GetData(request.Program, request.Range);
             }
         } catch (const std::exception& ex) {
             dataRequestFuture = NThreading::MakeFuture(NSo::TGetDataResponse(TString(ex.what())));
         }
 
-        // PendingDataRequests holds a copy of the request as map key —
-        // account for it explicitly.
-        const ui64 pendingKeyBytes = EstimateMetricTimeRangeBytes(request);
-        CurrentMetadataBytes += pendingKeyBytes;
-        PendingDataRequests[request] = RetryPolicy->CreateRetryState();
-
-        dataRequestFuture.Subscribe([request = std::move(request), actorSystem = TActivationContext::ActorSystem(), selfId = SelfId()](
-        NThreading::TFuture<NSo::TGetDataResponse> response) mutable -> void
+        dataRequestFuture.Subscribe([requestId,
+                                     actorSystem = TActivationContext::ActorSystem(),
+                                     selfId = SelfId()](
+            NThreading::TFuture<NSo::TGetDataResponse> response) mutable -> void
         {
             actorSystem->Send(selfId, new TEvSolomonProvider::TEvNewDataBatch(
                 response.ExtractValue(),
-                std::move(request)
+                requestId
             ));
         });
     }
 
-    void ParsePointsCount(const NSo::TMetric& metric, ui64 pointsCount) {
-        auto ranges = SplitTimeIntervalIntoRanges(pointsCount);
-
-        for (const auto& [fromRange, toRange] : ranges) {
-            NSo::TMetricTimeRange entry{metric.Selectors, "", fromRange, toRange};
-            CurrentMetadataBytes += EstimateMetricTimeRangeBytes(entry);
-            MetricsWithTimeRange.emplace_back(std::move(entry));
-        }
-        ListedTimeRanges += ranges.size();
-    }
-
-    std::vector<std::pair<TInstant, TInstant>> SplitTimeIntervalIntoRanges(ui64 pointsCount) const {
-        TInstant from = TrueRangeFrom;
-        TInstant to = TrueRangeTo;
-
-        std::vector<std::pair<TInstant, TInstant>> result;
-        if (pointsCount == 0) {
-            return result;
-        }
-
-        ui64 timeIntervals = ceil(pointsCount * 1.0 / MaxPointsPerOneRequest);
-        result.reserve(timeIntervals);
-        auto rangeDuration = to - from;
-        for (ui64 i = 0; i < timeIntervals; ++i) {
-            result.emplace_back(
-                from + rangeDuration * 1.0 / timeIntervals * i,
-                from + rangeDuration * 1.0 / timeIntervals * (i + 1)
-            );
-        }
-
-        return result;
-    }
-
     bool SaveDataBatch(TEvSolomonProvider::TEvNewDataBatch::TPtr& newDataBatch) {
         auto& batch = *newDataBatch->Get();
-        auto request = std::move(batch.Request);
+        
+        auto pendingIt = PendingDataRequests.find(batch.RequestId);
+        YQL_ENSURE(pendingIt != PendingDataRequests.end());
+
+        auto& request = pendingIt->second;
+
+        CurrentDataBytesInflight -= std::min(CurrentDataBytesInflight, request.InflightBytes);
+        CurrentDataInflight--;
 
         if (batch.Response.Status == NSo::EStatus::STATUS_RETRIABLE_ERROR) {
-            if (auto retryIt = PendingDataRequests.find(request); retryIt != PendingDataRequests.end() && retryIt->second) {
-                if (auto delay = retryIt->second->GetNextRetryDelay(batch.Response)) {
-                    SOURCE_LOG_D("HandleNewDataBatch: retrying data request, delay: " << delay->MilliSeconds());
-                    Schedule(*delay, new TEvSolomonProvider::TEvRetryDataRequest(std::move(request)));
-                    return false;
-                }
+            if (auto delay = request.State->GetNextRetryDelay(batch.Response)) {
+                SOURCE_LOG_D("HandleNewDataBatch: retrying data request, delay: " << delay->MilliSeconds());
+                // Refund inflight accounting; the retried request will re-add it.
+                Schedule(*delay, new TEvSolomonProvider::TEvRetryDataRequest(request.RequestId));
+                return false;
             }
         }
-
-        const ui64 estimatedBytes = EstimateDataRequestBytes(request, MaxPointsPerOneRequest);
-        CurrentDataBytesInflight -= std::min(CurrentDataBytesInflight, estimatedBytes);
-
-        IngressStats.Bytes += batch.Response.DownloadedBytes;
-        IngressStats.Rows += batch.Response.Result.Timeseries.size();
-        IngressStats.Chunks++;
-        IngressStats.Resume();
-        if (auto it = PendingDataRequests.find(request); it != PendingDataRequests.end()) {
-            const ui64 pendingKeyBytes = EstimateMetricTimeRangeBytes(it->first);
-            CurrentMetadataBytes -= std::min(CurrentMetadataBytes, pendingKeyBytes);
-            PendingDataRequests.erase(it);
-        }
-        CurrentDataInflight--;
-        
         if (batch.Response.Status != NSo::EStatus::STATUS_OK) {
             TIssues issues { TIssue(batch.Response.Error) };
             SOURCE_LOG_W("Got " << "error data response[" << newDataBatch->Cookie << "] from solomon: " << issues.ToOneLineString());
@@ -700,11 +822,39 @@ private:
             return false;
         }
 
+        IngressStats.Bytes += batch.Response.DownloadedBytes;
+        IngressStats.Rows += batch.Response.Result.Timeseries.size();
+        IngressStats.Chunks++;
+        IngressStats.Resume();
+
+        SOURCE_LOG_D(TStringBuilder() << "HandleNewDataBatch: got " << batch.Response.Result.Timeseries.size() << " metrics");
+
         for (auto& metric : batch.Response.Result.Timeseries) {
             MetricsData.emplace_back(std::move(metric));
             CurrentDataBytesStored += MetricsData.back().TotalSize;
         }
-        CompletedTimeRanges++;
+
+        // [DIAG] Count points in this response and update min/max stats
+        {
+            ui64 diagTimeseriesCount = batch.Response.Result.Timeseries.size();
+            ui64 diagPointsInResponse = 0;
+            // Timeseries were moved out, but we can count from the last N MetricsData entries
+            auto it = MetricsData.end();
+            for (ui64 i = 0; i < diagTimeseriesCount && it != MetricsData.begin(); ++i) {
+                --it;
+                diagPointsInResponse += it->Timeseries.Timestamps.size();
+            }
+            DiagTotalPointsReturned += diagPointsInResponse;
+            DiagMinPointsPerRequest = std::min(DiagMinPointsPerRequest, diagPointsInResponse);
+            DiagMaxPointsPerRequest = std::max(DiagMaxPointsPerRequest, diagPointsInResponse);
+            SOURCE_LOG_I("[DIAG] DataBatchReceived: reqId=" << batch.RequestId
+                << ", timeseriesCount=" << diagTimeseriesCount
+                << ", pointsInResponse=" << diagPointsInResponse
+                << ", completedRanges=" << (CompletedTimeRanges + std::max<ui64>(1, request.SelectorsBatch.size())) << "/" << ListedTimeRanges);
+        }
+
+        CompletedTimeRanges += std::max<ui64>(1, request.SelectorsBatch.size());
+        PendingDataRequests.erase(pendingIt);
 
         return true;
     }
@@ -719,13 +869,15 @@ private:
     const TString LogPrefix;
     const TDqSolomonReadParams ReadParams;
     const ui64 ComputeActorBatchSize;
-    const TInstant TrueRangeFrom;
-    const TInstant TrueRangeTo;
     const ui64 MetricsQueueConsumersCountDelta;
     const ui64 MaxApiInflight;
     const ui64 MaxDataInflightBytes;
     const ui64 MaxMetadataInflightBytes;
     const ui64 MaxPointsPerOneRequest;
+    const ui64 MaxSelectorsPerBatch;
+    const ui64 TruePointsFindRangeSec;
+    const bool DownsamplingEnabled;
+    NSo::TTimeRange NonDownsampledRange;
     IRetryPolicy<NSo::TGetDataResponse>::TPtr RetryPolicy;
 
     bool Bootstrapped = false;
@@ -737,21 +889,69 @@ private:
     bool IsMetricsQueueEmpty = false;
     bool IsConfirmedMetricsQueueFinish = false;
 
-    std::map<NSo::TMetricTimeRange, IRetryPolicy<NSo::TGetDataResponse>::IRetryState::TPtr> PendingDataRequests;
-    std::deque<NSo::TMetric> ListedMetrics;
-    std::deque<NSo::TMetricTimeRange> MetricsWithTimeRange;
+    ui64 NextRequestId = 0;
+
+    struct TPointsCountRequest {
+        ui64 RequestId = 0;
+
+        TSizedSelectors Selectors;
+    };
+    std::unordered_map<ui64, TPointsCountRequest> PendingPointsCountRequests;
+
+    // Per in-flight request retry state + the inflight bytes booked on the
+    // data-bytes budget (recorded so we can refund the exact amount on retry
+    // / completion).
+    struct TDataRequest {
+        ui64 RequestId = 0;
+        ui64 InflightBytes = 0;
+
+        NSo::TTimeRange Range;
+        std::vector<NSo::TSelectors> SelectorsBatch;
+        TString Program; // non-empty only in "limited" (single-program) mode
+
+        IRetryPolicy<NSo::TGetDataResponse>::IRetryState::TPtr State;
+    };
+    std::unordered_map<ui64, TDataRequest> PendingDataRequests;
+
+    // Buffer of metrics awaiting GetPointsCount; only used when downsampling
+    // is disabled. In downsampling mode metrics flow directly from
+    // HandleMetricsBatch into PendingByRange, skipping this deque.
+    std::deque<TSizedSelectors> ListedMetrics;
+    // Pending lines grouped by (From, To). Each bucket entry is a (selectors,
+    // per-line points-count) pair. The interval with the largest bucket is
+    // chosen in RequestData() via a linear scan.
+    std::map<NSo::TTimeRange, std::vector<std::pair<TSizedSelectors, ui64>>> PendingByRange;
+    // Pre-computed sub-ranges shared across all metrics in the downsampling-
+    // enabled mode (each metric has the same expected point count).
+    std::vector<std::pair<NSo::TTimeRange, ui64>> SharedRanges;
+
     std::deque<TSizedTimeseries> MetricsData;
     ui64 ListedMetricsCount = 0;
     ui64 CompletedMetricsCount = 0;
     ui64 ListedTimeRanges = 0;
     ui64 CompletedTimeRanges = 0;
-    // Bytes held in data containers (MetricsData)
+    // Decoded response payload waiting to be delivered to the compute actor
+    // (bytes of timestamp+value pairs accumulated in MetricsData).
     ui64 CurrentDataBytesStored = 0;
     ui64 CurrentDataInflight = 0;
+    // Sum of expected response sizes for outstanding GetData requests
+    // (charged against MaxDataInflightBytes).
     ui64 CurrentDataBytesInflight = 0;
-    // Bytes held in metadata containers (ListedMetrics, MetricsWithTimeRange, PendingDataRequests keys)
+    // Selector bytes currently owned by ListedMetrics + PendingByRange.
+    // The two containers share the MaxMetadataInflightBytes quota; nothing
+    // else (response payload, request metadata, retry state) is accounted
+    // here.
     ui64 CurrentMetadataBytes = 0;
-    ui64 CurrentPointsCountBytesInflight = 0;
+
+    // [DIAG] Temporary diagnostic counters (remove with all [DIAG] code)
+    ui64 DiagTotalDataRequests = 0;
+    ui64 DiagTotalPointsReturned = 0;
+    ui64 DiagMinPointsPerRequest = Max<ui64>();
+    ui64 DiagMaxPointsPerRequest = 0;
+    ui64 DiagTotalSelectorsInRequests = 0;
+    ui64 DiagMinSelectorsPerRequest = Max<ui64>();
+    ui64 DiagMaxSelectorsPerRequest = 0;
+
     TString SourceId;
     std::shared_ptr<NYdb::ICredentialsProvider> CredentialsProvider;
     NSo::ISolomonAccessorClient::TPtr SolomonClient;

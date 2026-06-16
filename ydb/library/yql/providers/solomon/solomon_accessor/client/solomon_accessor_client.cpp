@@ -226,7 +226,7 @@ TListMetricsLabelsResponse ProcessListMetricsLabelsResponse(NYql::IHTTPGateway::
     return TListMetricsLabelsResponse(std::move(result), response.Content.size() + response.Content.Headers.size());
 }
 
-TGetPointsCountResponse ProcessGetPointsCountResponse(NYql::IHTTPGateway::TResult&& response, ui64 downsampledPointsCount) {
+TGetPointsCountResponse ProcessGetPointsCountResponse(NYql::IHTTPGateway::TResult&& response) {
     TGetPointsCountResult result;
 
     if (response.CurlResponseCode != CURLE_OK) {
@@ -250,7 +250,7 @@ TGetPointsCountResponse ProcessGetPointsCountResponse(NYql::IHTTPGateway::TResul
             // Known benign condition: the metric exists but has no data points in
             // the requested time range.  Treat it as zero points rather than an error.
             if (message.Contains("Not able to apply function count on vector with size 0")) {
-                result.PointsCount = downsampledPointsCount;
+                result.PointsCount = 0;
                 return TGetPointsCountResponse(std::move(result), response.Content.size() + response.Content.Headers.size());
             }
             return TGetPointsCountResponse(TStringBuilder() << "Monitoring api points count response: " << message <<
@@ -274,7 +274,7 @@ TGetPointsCountResponse ProcessGetPointsCountResponse(NYql::IHTTPGateway::TResul
         return TGetPointsCountResponse("Monitoring api points count response doesn't contain requested info");
     }
 
-    result.PointsCount = json["scalar"].GetInteger() + downsampledPointsCount;
+    result.PointsCount = json["scalar"].GetInteger();
 
     return TGetPointsCountResponse(std::move(result), response.Content.size() + response.Content.Headers.size());
 }
@@ -294,34 +294,35 @@ TGetDataResponse ProcessGetDataResponse(NYdbGrpc::TGrpcStatus&& status, ReadResp
         return TGetDataResponse(error);
     }
 
-    if (response.response_per_query_size() != 1) {
+    if (response.response_per_query_size() == 0) {
         return TGetDataResponse("Monitoring api get data response is invalid");
     }
 
-    const auto& responseValue = response.response_per_query()[0];
-    if (!responseValue.has_timeseries_vector()) {
-        return TGetDataResponse("Monitoring api get data response: missing timeseries_vector in response");
-    }
-    for (const auto& queryResponse : responseValue.timeseries_vector().values()) {
-        auto type = MetricTypeToString(queryResponse.type());
-
-        TSelectors selectors;
-        for (const auto& [key, value] : queryResponse.labels()) {
-            selectors[key] = {"==", value};
+    for (const auto& responseValue : response.response_per_query()) {
+        if (!responseValue.has_timeseries_vector()) {
+            return TGetDataResponse("Monitoring api get data response: missing timeseries_vector in response");
         }
-        std::vector<int64_t> timestamps(queryResponse.timestamp_values().values().begin(), queryResponse.timestamp_values().values().end());
-        std::vector<double> values(queryResponse.double_values().values().begin(), queryResponse.double_values().values().end());
+        for (const auto& queryResponse : responseValue.timeseries_vector().values()) {
+            auto type = MetricTypeToString(queryResponse.type());
 
-        if (TString name = queryResponse.name()) {
-            selectors["name"] = {"==", name};
+            TSelectors selectors;
+            for (const auto& [key, value] : queryResponse.labels()) {
+                selectors[key] = {"==", value};
+            }
+            std::vector<int64_t> timestamps(queryResponse.timestamp_values().values().begin(), queryResponse.timestamp_values().values().end());
+            std::vector<double> values(queryResponse.double_values().values().begin(), queryResponse.double_values().values().end());
+
+            if (TString name = queryResponse.name()) {
+                selectors["name"] = {"==", name};
+            }
+
+            TMetric metric {
+                .Selectors = std::move(selectors),
+                .Type = std::move(type),
+            };
+
+            result.Timeseries.emplace_back(std::move(metric), std::move(timestamps), std::move(values));
         }
-
-        TMetric metric {
-            .Selectors = std::move(selectors),
-            .Type = std::move(type),
-        };
-
-        result.Timeseries.emplace_back(std::move(metric), std::move(timestamps), std::move(values));
     }
 
     return TGetDataResponse(std::move(result), response.ByteSize());
@@ -392,8 +393,8 @@ public:
     }
 
 public:
-    NThreading::TFuture<TGetLabelsResponse> GetLabelNames(const TSelectors& selectors, TInstant from, TInstant to) const override final {
-        auto [url, body] = BuildGetLabelsHttpParams(selectors, from, to);
+    NThreading::TFuture<TGetLabelsResponse> GetLabelNames(const TSelectors& selectors, TTimeRange range) const override final {
+        auto [url, body] = BuildGetLabelsHttpParams(selectors, range);
 
         auto resultPromise = NThreading::NewPromise<TGetLabelsResponse>();
         
@@ -414,8 +415,8 @@ public:
         return resultPromise.GetFuture();
     }
 
-    NThreading::TFuture<TListMetricsResponse> ListMetrics(const TSelectors& selectors, TInstant from, TInstant to) const override final {
-        auto [url, body] = BuildListMetricsHttpParams(selectors, from, to);
+    NThreading::TFuture<TListMetricsResponse> ListMetrics(const TSelectors& selectors, TTimeRange range) const override final {
+        auto [url, body] = BuildListMetricsHttpParams(selectors, range);
 
         auto resultPromise = NThreading::NewPromise<TListMetricsResponse>();
         
@@ -436,8 +437,8 @@ public:
         return resultPromise.GetFuture();
     }
 
-    NThreading::TFuture<TListMetricsLabelsResponse> ListMetricsLabels(const TSelectors& selectors, TInstant from, TInstant to) const override final {
-        auto [url, body] = BuildListMetricsLabelsHttpParams(selectors, from, to);
+    NThreading::TFuture<TListMetricsLabelsResponse> ListMetricsLabels(const TSelectors& selectors, TTimeRange range) const override final {
+        auto [url, body] = BuildListMetricsLabelsHttpParams(selectors, range);
 
         auto resultPromise = NThreading::NewPromise<TListMetricsLabelsResponse>();
         
@@ -458,65 +459,52 @@ public:
         return resultPromise.GetFuture();
     }
 
-    NThreading::TFuture<TGetPointsCountResponse> GetPointsCount(const TSelectors& selectors, TInstant from, TInstant to) const override final {        
+    NThreading::TFuture<TGetPointsCountResponse> GetPointsCount(const TSelectors& selectors, TTimeRange range) const override final {        
+        auto [url, body] = BuildGetPointsCountHttpParams(selectors, range);
+        
         auto resultPromise = NThreading::NewPromise<TGetPointsCountResponse>();
+        
+        auto cb = [resultPromise](NYql::IHTTPGateway::TResult&& response) mutable {
+            resultPromise.SetValue(ProcessGetPointsCountResponse(std::move(response)));
+        };
 
-        TInstant sevenDaysAgo = TInstant::Now() - NConstants::DownsamplingCutoff;
+        auto error = DoHttpRequest(
+            std::move(cb),
+            std::move(url),
+            std::move(body)
+        );
 
-        TInstant downsamplingFrom = from;
-        TInstant downsamplingTo = Settings.GetDownsampling().GetDisabled() ? std::max(std::min(sevenDaysAgo, to), from) : to;
-        ui64 gridMs = Settings.GetDownsampling().GetDisabled() ? NConstants::DefaultGridInterval.MilliSeconds() : Settings.GetDownsampling().GetGridMs();
-
-        ui64 downsampledPointsCount = ceil((downsamplingTo - downsamplingFrom).Seconds() * 1000.0 / gridMs) + 1;
-
-        if (downsamplingTo < to) {
-            auto fullSelectors = AddRequiredLabels(selectors);
-            TString program = TStringBuilder() << "count(" << BuildSelectorsProgram(fullSelectors) << ")";
-            
-            auto [url, body] = BuildGetPointsCountHttpParams(program, downsamplingTo, to);
-            
-            auto cb = [resultPromise, downsampledPointsCount](NYql::IHTTPGateway::TResult&& response) mutable {
-                resultPromise.SetValue(ProcessGetPointsCountResponse(std::move(response), downsampledPointsCount));
-            };
-    
-            auto error = DoHttpRequest(
-                std::move(cb),
-                std::move(url),
-                std::move(body)
-            );
-
-            if (error) {
-                return NThreading::MakeFuture(TGetPointsCountResponse(*error));
-            }
-
-        } else {
-            TGetPointsCountResult result;
-            result.PointsCount = downsampledPointsCount;
-
-            resultPromise.SetValue(TGetPointsCountResponse(std::move(result), 0));
+        if (error) {
+            return NThreading::MakeFuture(TGetPointsCountResponse(*error));
         }
 
         return resultPromise.GetFuture();
     }
 
-    NThreading::TFuture<TGetDataResponse> GetData(const TSelectors& selectors, TInstant from, TInstant to) const override final {
-        auto fullSelectors = AddRequiredLabels(selectors);
-        bool isMonitoring = Settings.GetClusterType() == NProto::CT_MONITORING;
+    NThreading::TFuture<TGetDataResponse> GetData(const std::vector<TSelectors>& selectorsBatch, TTimeRange range) const override final {
+        const bool isMonitoring = Settings.GetClusterType() == NProto::CT_MONITORING;
 
-        if (isMonitoring) {
-            fullSelectors["folderId"] = fullSelectors["cluster"];
-            fullSelectors.erase("cluster");
-            fullSelectors.erase("project");
+        std::vector<TString> programs;
+        programs.reserve(selectorsBatch.size());
+        for (const auto& selectors : selectorsBatch) {
+            auto fullSelectors = AddRequiredLabels(selectors);
+            if (isMonitoring) {
+                fullSelectors["folderId"] = fullSelectors["cluster"];
+                fullSelectors.erase("cluster");
+                fullSelectors.erase("project");
+            }
+            programs.push_back(BuildSelectorsProgram(fullSelectors, isMonitoring));
         }
 
-        TString program = BuildSelectorsProgram(fullSelectors, isMonitoring);
-
-        return GetData(program, from, to);
+        return DoGetData(BuildGetDataRequest(programs, range));
     }
 
-    NThreading::TFuture<TGetDataResponse> GetData(const TString& program, TInstant from, TInstant to) const override final {
-        const auto request = BuildGetDataRequest(program, from, to);
+    NThreading::TFuture<TGetDataResponse> GetData(const TString& program, TTimeRange range) const override final {
+        return DoGetData(BuildGetDataRequest({program}, range));
+    }
 
+private:
+    NThreading::TFuture<TGetDataResponse> DoGetData(ReadRequest request) const {
         NYdbGrpc::TCallMeta callMeta;
         TString authInfo;
         if (auto error = GetAuthInfo(authInfo)) {
@@ -551,7 +539,6 @@ public:
         return resultPromise.GetFuture();
     }
 
-private:
     std::optional<TString> GetAuthInfo(TString& auth) const {
         auth.clear();
 
@@ -626,7 +613,7 @@ private:
         return {};
     }
 
-    std::tuple<TString, TString> BuildGetLabelsHttpParams(const TSelectors& selectors, TInstant from, TInstant to) const {
+    std::tuple<TString, TString> BuildGetLabelsHttpParams(const TSelectors& selectors, TTimeRange range) const {
         TUrlBuilder builder(GetHttpSolomonEndpoint());
 
         builder.AddPathComponent("api");
@@ -641,19 +628,19 @@ private:
         if (EnableSolomonClientPostApi) {
             w.BeginObject()
                 .UnsafeWriteKey("selectors").WriteString(BuildSelectorsProgram(selectors))
-                .UnsafeWriteKey("from").WriteString(from.ToString())
-                .UnsafeWriteKey("to").WriteString(to.ToString())
+                .UnsafeWriteKey("from").WriteString(range.From.ToString())
+                .UnsafeWriteKey("to").WriteString(range.To.ToString())
             .EndObject();
         } else {
             builder.AddUrlParam("selectors", BuildSelectorsProgram(selectors));
-            builder.AddUrlParam("from", from.ToString());
-            builder.AddUrlParam("to", to.ToString());
+            builder.AddUrlParam("from", range.From.ToString());
+            builder.AddUrlParam("to", range.To.ToString());
         }
 
         return { builder.Build(), w.Str() };
     }
 
-    std::tuple<TString, TString> BuildListMetricsHttpParams(const TSelectors& selectors, TInstant from, TInstant to) const {
+    std::tuple<TString, TString> BuildListMetricsHttpParams(const TSelectors& selectors, TTimeRange range) const {
         TUrlBuilder builder(GetHttpSolomonEndpoint());
 
         builder.AddPathComponent("api");
@@ -669,19 +656,19 @@ private:
         if (EnableSolomonClientPostApi) {
             w.BeginObject()
                 .UnsafeWriteKey("selectors").WriteString(BuildSelectorsProgram(selectors))
-                .UnsafeWriteKey("from").WriteString(from.ToString())
-                .UnsafeWriteKey("to").WriteString(to.ToString())
+                .UnsafeWriteKey("from").WriteString(range.From.ToString())
+                .UnsafeWriteKey("to").WriteString(range.To.ToString())
             .EndObject();
         } else {
             builder.AddUrlParam("selectors", BuildSelectorsProgram(selectors));
-            builder.AddUrlParam("from", from.ToString());
-            builder.AddUrlParam("to", to.ToString());
+            builder.AddUrlParam("from", range.From.ToString());
+            builder.AddUrlParam("to", range.To.ToString());
         }
 
         return { builder.Build(), w.Str() };
     }
 
-    std::tuple<TString, TString> BuildListMetricsLabelsHttpParams(const TSelectors& selectors, TInstant from, TInstant to) const {
+    std::tuple<TString, TString> BuildListMetricsLabelsHttpParams(const TSelectors& selectors, TTimeRange range) const {
         TUrlBuilder builder(GetHttpSolomonEndpoint());
 
         builder.AddPathComponent("api");
@@ -696,21 +683,23 @@ private:
         if (EnableSolomonClientPostApi) {
             w.BeginObject()
                 .UnsafeWriteKey("selectors").WriteString(BuildSelectorsProgram(selectors))
-                .UnsafeWriteKey("from").WriteString(from.ToString())
-                .UnsafeWriteKey("to").WriteString(to.ToString())
+                .UnsafeWriteKey("from").WriteString(range.From.ToString())
+                .UnsafeWriteKey("to").WriteString(range.To.ToString())
                 .UnsafeWriteKey("limit").WriteLongLong(LabelsListingLimit)
             .EndObject();
         } else {
             builder.AddUrlParam("selectors", BuildSelectorsProgram(selectors));
-            builder.AddUrlParam("from", from.ToString());
-            builder.AddUrlParam("to", to.ToString());
+            builder.AddUrlParam("from", range.From.ToString());
+            builder.AddUrlParam("to", range.To.ToString());
             builder.AddUrlParam("limit", ToString(LabelsListingLimit));
         }
 
         return { builder.Build(), w.Str() };
     }
 
-    std::tuple<TString, TString> BuildGetPointsCountHttpParams(const TString& program, TInstant from, TInstant to) const {
+    std::tuple<TString, TString> BuildGetPointsCountHttpParams(const TSelectors& selectors, TTimeRange range) const {
+        const auto fullSelectors = AddRequiredLabels(selectors);
+
         TUrlBuilder builder(GetHttpSolomonEndpoint());
 
         builder.AddPathComponent("api");
@@ -723,9 +712,9 @@ private:
         const auto& ds = Settings.GetDownsampling();
         NJsonWriter::TBuf w;
         w.BeginObject()
-            .UnsafeWriteKey("from").WriteString(from.ToString())
-            .UnsafeWriteKey("to").WriteString(to.ToString())
-            .UnsafeWriteKey("program").WriteString(program)
+            .UnsafeWriteKey("from").WriteString(range.From.ToString())
+            .UnsafeWriteKey("to").WriteString(range.To.ToString())
+            .UnsafeWriteKey("program").WriteString(TStringBuilder() << "count(" << BuildSelectorsProgram(fullSelectors) << ")")
             .UnsafeWriteKey("downsampling")
                 .BeginObject()
                     .UnsafeWriteKey("disabled").WriteBool(ds.GetDisabled());
@@ -741,7 +730,7 @@ private:
         return { builder.Build(), w.Str() };
     }
 
-    ReadRequest BuildGetDataRequest(const TString& program, TInstant from, TInstant to) const {
+    ReadRequest BuildGetDataRequest(const std::vector<TString>& programs, TTimeRange range) const {
         ReadRequest request;
 
         if (Settings.GetClusterType() == NProto::CT_SOLOMON) {
@@ -749,22 +738,32 @@ private:
         } else {
             request.mutable_container()->set_folder_id(Settings.GetCluster());
         }
-        *request.mutable_from_time() = NProtoInterop::CastToProto(from);
-        *request.mutable_to_time() = NProtoInterop::CastToProto(to);
+        *request.mutable_from_time() = NProtoInterop::CastToProto(range.From);
+        *request.mutable_to_time() = NProtoInterop::CastToProto(range.To);
 
-        if (Settings.GetDownsampling().GetDisabled()) {
-            request.mutable_downsampling()->set_disabled(true);
+        TInstant historicalDownsamplingCutoff = TInstant::Now() - NConstants::DownsamplingCutoff;
+
+        if (range.To <= historicalDownsamplingCutoff) {
+            request.mutable_downsampling()->set_grid_interval(NConstants::DefaultGridInterval.MilliSeconds());
+            request.mutable_downsampling()->set_grid_aggregation(Downsampling::GRID_AGGREGATION_AVG);
+            request.mutable_downsampling()->set_gap_filling(Downsampling::GAP_FILLING_PREVIOUS);
         } else {
-            const auto downsampling = Settings.GetDownsampling();
-            request.mutable_downsampling()->set_grid_interval(downsampling.GetGridMs());
-            request.mutable_downsampling()->set_grid_aggregation(ParseGridAggregation(downsampling.GetAggregation()));
-            request.mutable_downsampling()->set_gap_filling(ParseGapFilling(downsampling.GetFill()));
+            if (Settings.GetDownsampling().GetDisabled()) {
+                request.mutable_downsampling()->set_disabled(true);
+            } else {
+                const auto downsampling = Settings.GetDownsampling();
+                request.mutable_downsampling()->set_grid_interval(downsampling.GetGridMs());
+                request.mutable_downsampling()->set_grid_aggregation(ParseGridAggregation(downsampling.GetAggregation()));
+                request.mutable_downsampling()->set_gap_filling(ParseGapFilling(downsampling.GetFill()));
+            }
         }
 
-        auto query = request.mutable_queries()->Add();
-        *query->mutable_value() = program;
-        *query->mutable_name() = "query";
-        query->set_hidden(false);
+        for (size_t i = 0; i < programs.size(); ++i) {
+            auto query = request.mutable_queries()->Add();
+            *query->mutable_value() = programs[i];
+            *query->mutable_name() = TStringBuilder() << "query_" << i;
+            query->set_hidden(false);
+        }
 
         return request;
     }

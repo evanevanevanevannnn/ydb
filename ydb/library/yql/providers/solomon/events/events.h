@@ -86,27 +86,27 @@ struct TEvSolomonProvider {
     };
 
     struct TEvPointsCountBatch : public NActors::TEventLocal<TEvPointsCountBatch, EvPointsCountBatch> {
-        NSo::TMetric Metric;
         NSo::TGetPointsCountResponse Response;
-        TEvPointsCountBatch(NSo::TMetric&& metric, const NSo::TGetPointsCountResponse& response)
-            : Metric(std::move(metric))
-            , Response(response)
+        ui64 RequestId;
+        TEvPointsCountBatch(const NSo::TGetPointsCountResponse& response, ui64 requestId)
+            : Response(response)
+            , RequestId(requestId)
         {}
     };
-    
+
     struct TEvNewDataBatch: public NActors::TEventLocal<TEvNewDataBatch, EvNewDataBatch> {
         NSo::TGetDataResponse Response;
-        NSo::TMetricTimeRange Request;
-        TEvNewDataBatch(NSo::TGetDataResponse&& response, NSo::TMetricTimeRange&& request)
+        ui64 RequestId;
+        TEvNewDataBatch(NSo::TGetDataResponse&& response, ui64 requestId)
             : Response(std::move(response))
-            , Request(std::move(request))
+            , RequestId(requestId)
         {}
     };
 
     struct TEvRetryDataRequest: public NActors::TEventLocal<TEvRetryDataRequest, EvRetryDataRequest> {
-        NSo::TMetricTimeRange Request;
-        explicit TEvRetryDataRequest(NSo::TMetricTimeRange&& request)
-            : Request(std::move(request))
+        ui64 RequestId;
+        explicit TEvRetryDataRequest(ui64 requestId)
+            : RequestId(requestId)
         {}
     };
 };

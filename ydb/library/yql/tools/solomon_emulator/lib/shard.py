@@ -202,6 +202,9 @@ class Shard(object):
         else:
             downsampling_disabled = False
             downsampling_grid_interval = int(downsampling.grid_interval)
+            if downsampling_grid_interval == 0:
+                downsampling_disabled = True
+                downsampling_grid_interval = 1
 
         matching_metrics = self.get_matching_metrics(selectors)
         if len(matching_metrics) != 1:
@@ -217,7 +220,7 @@ class Shard(object):
         timestamps, values = [], []
         count = 0
         for ts, value in metric.data:
-            if isinstance(ts, str) or (ts >= nanoseconds_from and ts <= nanoseconds_to):
+            if isinstance(ts, str) or (ts >= nanoseconds_from and ts < nanoseconds_to):
                 if downsampling_disabled or ts % downsampling_grid_interval == 0:
                     timestamps.append(ts)
                     values.append(value)
@@ -232,6 +235,16 @@ class Shard(object):
         result["values"] = values
 
         return (result, "")
+
+    def get_points_count(self, selectors, time_from_ms, time_to_ms):
+        """Count data points matching selectors within [time_from_ms, time_to_ms]."""
+        matching_metrics = self.get_matching_metrics(selectors)
+        count = 0
+        for metric in matching_metrics:
+            for ts, value in metric.data:
+                if isinstance(ts, str) or (ts >= time_from_ms and ts <= time_to_ms):
+                    count += 1
+        return count
 
     def as_text(self):
         m = list()

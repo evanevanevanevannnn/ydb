@@ -34,20 +34,25 @@ struct TSolomonReadActorConfig {
     // ── read_actor only ─────────────────────────────────────────────────────
     // Number of timeseries batched per notification to the compute actor. Must be >= 1.
     ui64 ComputeActorBatchSize;
-    // Maximum total bytes of in-flight data responses before backpressure. Must be >= 1.
-    ui64 MaxDataInflightBytes;
-    // Maximum total bytes occupied by metadata buffers (ListedMetrics,
-    // MetricsWithTimeRange, PendingDataRequests_ keys) plus selectors
+    // Maximum total MB of in-flight data responses before backpressure. Must be >= 1.
+    ui64 MaxDataInflightMb;
+    // Maximum total MB occupied by metadata buffers (ListedMetrics,
+    // PendingByInterval, PendingDataRequests keys) plus selectors
     // captured by in-flight GetPointsCount lambdas. Acts as a separate
     // backpressure budget so that metadata growth cannot starve out the
     // data pipeline. Must be >= 1.
-    ui64 MaxMetadataInflightBytes;
+    ui64 MaxMetadataInflightMb;
     // Seconds added/subtracted around [from, to] when searching for true data points.
     ui64 TruePointsFindRangeSec;
     // Maximum number of data points fetched in a single GetData gRPC request.
     // Time ranges are split so that each sub-range contains at most this many points.
+    // Also bounds how many selectors can be packed into a batched request
+    // (batch_size * per_interval_points <= MaxPointsPerOneRequest).
     // Must be >= 1.
     ui64 MaxPointsPerOneRequest;
+    // Maximum number of selectors packed into a single batched GetData request.
+    // Must be >= 1.
+    ui64 MaxSelectorsPerBatch;
 
     // ── metrics_queue only ──────────────────────────────────────────────────
     // Number of metrics sent per batch to a consumer. Must be >= 1.
@@ -85,8 +90,8 @@ struct TSelector {
 
 using TSelectors = std::map<TString, TSelector>;
 
-void SelectorsToProto(const TSelectors& selectors, NYql::NSo::MetricQueue::TSelectors& proto);
-void ProtoToSelectors(const NYql::NSo::MetricQueue::TSelectors& proto, TSelectors& selectors);
+NYql::NSo::MetricQueue::TSelectors SelectorsToProto(const TSelectors& selectors);
+TSelectors ProtoToSelectors(const NYql::NSo::MetricQueue::TSelectors& proto);
 
 struct TMetric {
     TSelectors Selectors;
@@ -106,14 +111,23 @@ struct TLabelValues {
     std::vector<TString> Values;
 };
 
-struct TMetricTimeRange {
-    TSelectors Selectors;
-    TString Program;
+struct TTimeRange {
     TInstant From;
     TInstant To;
 
-    bool operator<(const TMetricTimeRange& other) const;
+    bool operator<(const TTimeRange& other) const {
+        return std::tie(From, To) < std::tie(other.From, other.To);
+    }
+    bool operator==(const TTimeRange& other) const {
+        return From == other.From && To == other.To;
+    }
 };
+
+// Uniformly splits range into N sub-ranges where
+// N = ceil(totalPointsCount / maxPointsPerRequest). Each sub-range gets the
+// same per-interval point count estimate (ceil-divided). Returns an empty
+// vector when totalPointsCount == 0.
+std::vector<std::pair<TTimeRange, ui64>> SplitIntoRanges(TTimeRange range, ui64 totalPointsCount, ui64 maxPointsPerRequest);
 
 TMaybe<TString> ParseSelectorValues(const TString& selectors, TSelectors& result);
 TMaybe<TString> BuildSelectorValues(const NSo::NProto::TDqSolomonSource& source, const TString& selectors, TSelectors& result);

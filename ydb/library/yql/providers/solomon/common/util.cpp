@@ -33,7 +33,7 @@ THolder<re2::RE2> SELECTORS_FULL_RE     = CompileRE2WithCheck(SELECTORS_FULL_PAT
 const TString USER_LABELS_PATTERN       = "(" + LABEL_NAME_PATTERN + ")(?: (?i:as) (" + LABEL_NAME_PATTERN + "))?";
 THolder<re2::RE2> USER_LABELS_RE        = CompileRE2WithCheck(USER_LABELS_PATTERN);
 
-TMaybe<TString> InsertOrCheck(NYql::NSo::TSelectors& selectors, const TString& name, const TString& value) {
+TMaybe<TString> InsertOrCheck(std::map<TString, NYql::NSo::TSelector>& selectors, const TString& name, const TString& value) {
     auto [it, inserted] = selectors.emplace(name, NYql::NSo::TSelector{"=", value});
     if (!inserted && it->second.Value != value) {
         return TStringBuilder() << "You shouldn't specify \"" << name << "\" label in selectors, already has value `" << it->second.Value << "`";
@@ -45,19 +45,23 @@ TMaybe<TString> InsertOrCheck(NYql::NSo::TSelectors& selectors, const TString& n
 
 namespace NYql::NSo {
 
-void SelectorsToProto(const TSelectors& selectors, NYql::NSo::MetricQueue::TSelectors& proto) {
+NYql::NSo::MetricQueue::TSelectors SelectorsToProto(const TSelectors& selectors) {
+    NYql::NSo::MetricQueue::TSelectors proto;
     for (const auto& [key, selector] : selectors) {
         NYql::NSo::MetricQueue::TSelector protoSelector;
         protoSelector.SetOperator(selector.Op);
         protoSelector.SetValue(selector.Value);
         proto.MutableSelectors()->emplace(key, std::move(protoSelector));
     }
+    return proto;
 }
 
-void ProtoToSelectors(const NYql::NSo::MetricQueue::TSelectors& proto, TSelectors& selectors) {
+TSelectors ProtoToSelectors(const NYql::NSo::MetricQueue::TSelectors& proto) {
+    TSelectors selectors;
     for (const auto& [key, selector] : proto.GetSelectors()) {
         selectors[key] = {selector.GetOperator(), selector.GetValue()};
     }
+    return selectors;
 }
 
 bool TSelector::operator==(const TSelector& other) const {
@@ -69,12 +73,32 @@ bool TSelector::operator<(const TSelector& other) const {
            std::tie(other.Op, other.Value);
 }
 
-bool TMetricTimeRange::operator<(const TMetricTimeRange& other) const {
-    return std::tie(Selectors, Program, From, To) < 
-           std::tie(other.Selectors, other.Program, other.From, other.To);
+std::vector<std::pair<TTimeRange, ui64>> SplitIntoRanges(TTimeRange range, ui64 totalPointsCount, ui64 maxPointsPerRequest)
+{
+    std::vector<std::pair<TTimeRange, ui64>> result;
+    if (totalPointsCount == 0 || maxPointsPerRequest == 0) {
+        return result;
+    }
+
+    const ui64 timeRanges = (totalPointsCount + maxPointsPerRequest - 1) / maxPointsPerRequest;
+    const ui64 pointsPerRange = (totalPointsCount + timeRanges - 1) / timeRanges;
+
+    result.reserve(timeRanges);
+    const auto rangeDuration = range.To - range.From;
+    for (ui64 i = 0; i < timeRanges; ++i) {
+        result.push_back({
+            {
+                range.From + rangeDuration * 1.0 / timeRanges * i,
+                range.From + rangeDuration * 1.0 / timeRanges * (i + 1)
+            },
+            pointsPerRange
+        });
+    }
+
+    return result;
 }
 
-TMaybe<TString> ParseSelectorValues(const TString& selectors, TSelectors& result) {
+TMaybe<TString> ParseSelectorValues(const TString& selectors, std::map<TString, TSelector>& result) {
     std::optional<TString> sensorName;
     TString fullBrackets;
     if (!RE2::FullMatch(selectors, *SENSOR_NAME_RE, &sensorName, &fullBrackets)) {
@@ -109,28 +133,30 @@ TMaybe<TString> BuildSelectorValues(const NSo::NProto::TDqSolomonSource& source,
             return error;           \
         }
 
-    RET_ON_ERROR(ParseSelectorValues(selectors, result));
+    std::map<TString, TSelector> selectorsMap;
+    RET_ON_ERROR(ParseSelectorValues(selectors, selectorsMap));
 
     if (source.GetClusterType() == NSo::NProto::CT_MONITORING) {
-        RET_ON_ERROR(InsertOrCheck(result, "cloudId", source.GetProject()));
-        RET_ON_ERROR(InsertOrCheck(result, "folderId", source.GetCluster()));
-        RET_ON_ERROR(InsertOrCheck(result, "service", source.GetService()));
+        RET_ON_ERROR(InsertOrCheck(selectorsMap, "cloudId", source.GetProject()));
+        RET_ON_ERROR(InsertOrCheck(selectorsMap, "folderId", source.GetCluster()));
+        RET_ON_ERROR(InsertOrCheck(selectorsMap, "service", source.GetService()));
     } else {
-        RET_ON_ERROR(InsertOrCheck(result, "project", source.GetProject()));
+        RET_ON_ERROR(InsertOrCheck(selectorsMap, "project", source.GetProject()));
     }
 
     if (source.GetClusterType() == NSo::NProto::CT_MONITORING) {
-        if (auto it = result.find("cloudId"); it != result.end()) {
-            result["project"] = it->second;
-            result.erase(it);
+        if (auto it = selectorsMap.find("cloudId"); it != selectorsMap.end()) {
+            selectorsMap["project"] = it->second;
+            selectorsMap.erase(it);
         }
-        if (auto it = result.find("folderId"); it != result.end()) {
-            result["cluster"] = it->second;
-            result.erase(it);
+        if (auto it = selectorsMap.find("folderId"); it != selectorsMap.end()) {
+            selectorsMap["cluster"] = it->second;
+            selectorsMap.erase(it);
         }
     }
 
     #undef RET_ON_ERROR
+    result = TSelectors(std::move(selectorsMap));
     return {};
 }
 
@@ -264,10 +290,11 @@ TSolomonReadActorConfig ParseSolomonReadActorConfig(
     cfg.EnablePostApi = ParseBoolSetting(settings, "enableSolomonClientPostApi", false);
 
     cfg.ComputeActorBatchSize = ParseSettingWithMin<ui64>(settings, "computeActorBatchSize", 100, 1);
-    cfg.MaxDataInflightBytes = ParseSettingWithMin<ui64>(settings, "maxDataInflightBytes", 50_MB, 1);
-    cfg.MaxMetadataInflightBytes = ParseSettingWithMin<ui64>(settings, "maxMetadataInflightBytes", 5_MB, 1);
+    cfg.MaxDataInflightMb = ParseSettingWithMin<ui64>(settings, "maxDataInflightMb", 50, 1);
+    cfg.MaxMetadataInflightMb = ParseSettingWithMin<ui64>(settings, "maxMetadataInflightMb", 5, 1);
     cfg.TruePointsFindRangeSec = ParseSettingWithMin<ui64>(settings, "truePointsFindRange", 301, 1);
     cfg.MaxPointsPerOneRequest = ParseSettingWithMinMax<ui64>(settings, "maxPointsPerOneRequest", 10'000, 1, 10'000);
+    cfg.MaxSelectorsPerBatch = ParseSettingWithMin<ui64>(settings, "maxSelectorsPerBatch", 100, 1);
     cfg.MetricsQueueBatchCountLimit = ParseSettingWithMin<ui64>(settings, "metricsQueueBatchCountLimit", 500, 1);
     cfg.MetricsQueuePrefetchSize = ParseSettingWithMin<ui64>(settings, "metricsQueuePrefetchSize", 1000, 1);
     cfg.PoisonTimeout = TDuration::Seconds(

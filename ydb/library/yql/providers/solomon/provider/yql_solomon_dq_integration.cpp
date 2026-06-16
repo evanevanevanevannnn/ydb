@@ -335,7 +335,7 @@ public:
             if (auto error = NSo::BuildSelectorValues(source, selectors, selectorValues)) {
                 throw yexception() << *error;
             }
-            NSo::SelectorsToProto(selectorValues, *source.MutableSelectors());
+            *source.MutableSelectors() = NSo::SelectorsToProto(selectorValues);
         }
 
         auto program = settings.Program().StringValue();
@@ -387,8 +387,10 @@ public:
         InsertSettingIfSet(source, "truePointsFindRange", solomonConfig->_TruePointsFindRange.Get());
         InsertSettingIfSet(source, "maxListingPageSize", solomonConfig->_MaxListingPageSize.Get());
         InsertSettingIfSet(source, "maxApiInflight", solomonConfig->MaxApiInflight.Get());
-        InsertSettingIfSet(source, "maxDataInflightBytes", solomonConfig->MaxDataInflightBytes.Get());
+        InsertSettingIfSet(source, "maxDataInflightMb", solomonConfig->MaxDataInflightMb.Get());
+        InsertSettingIfSet(source, "maxMetadataInflightMb", solomonConfig->MaxMetadataInflightMb.Get());
         InsertSettingIfSet(source, "maxPointsPerOneRequest", solomonConfig->MaxPointsPerOneRequest.Get());
+        InsertSettingIfSet(source, "maxSelectorsPerBatch", solomonConfig->MaxSelectorsPerBatch.Get());
         InsertSettingIfSet(source, "poisonTimeoutSec", solomonConfig->PoisonTimeoutSec.Get());
         InsertSettingIfSet(source, "roundRobinStageTimeoutMs", solomonConfig->RoundRobinStageTimeoutMs.Get());
         InsertSettingIfSet(source, "labelsListingLimit", solomonConfig->LabelsListingLimit.Get());

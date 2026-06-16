@@ -22,8 +22,10 @@ TSolomonConfiguration::TSolomonConfiguration()
     REGISTER_SETTING(*this, MetricsQueuePrefetchSize);
     REGISTER_SETTING(*this, ComputeActorBatchSize);
     REGISTER_SETTING(*this, MaxApiInflight);
-    REGISTER_SETTING(*this, MaxDataInflightBytes);
+    REGISTER_SETTING(*this, MaxDataInflightMb);
+    REGISTER_SETTING(*this, MaxMetadataInflightMb);
     REGISTER_SETTING(*this, MaxPointsPerOneRequest);
+    REGISTER_SETTING(*this, MaxSelectorsPerBatch);
     REGISTER_SETTING(*this, PoisonTimeoutSec);
     REGISTER_SETTING(*this, RoundRobinStageTimeoutMs);
     REGISTER_SETTING(*this, LabelsListingLimit);

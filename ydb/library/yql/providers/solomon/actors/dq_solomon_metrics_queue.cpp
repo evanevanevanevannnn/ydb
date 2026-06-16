@@ -86,8 +86,8 @@ public:
         , EnableSolomonClientPostApi(cfg.EnablePostApi)
         , BatchCountLimit(cfg.MetricsQueueBatchCountLimit)
         , PrefetchSize(cfg.MetricsQueuePrefetchSize)
-        , TrueRangeFrom(TInstant::Seconds(ReadParams.Source.GetFrom()) - TDuration::Seconds(cfg.TruePointsFindRangeSec))
-        , TrueRangeTo(TInstant::Seconds(ReadParams.Source.GetTo()) + TDuration::Seconds(cfg.TruePointsFindRangeSec))
+        , ExtendedRange(TInstant::Seconds(ReadParams.Source.GetFrom()) - TDuration::Seconds(cfg.TruePointsFindRangeSec),
+                        TInstant::Seconds(ReadParams.Source.GetTo()) + TDuration::Seconds(cfg.TruePointsFindRangeSec))
         , MaxListingPageSize(cfg.MaxListingPageSize)
         , MaxApiInflight(cfg.MaxApiInflight)
         , PoisonTimeout(cfg.PoisonTimeout)
@@ -102,8 +102,7 @@ public:
         LOG_I("TDqSolomonMetricsQueueActor", "Bootstrap there are metrics to list, consumersCount=" << ConsumersCount);
         Become(&TDqSolomonMetricsQueueActor::ThereAreMetricsToListState);
 
-        NSo::TSelectors selectors;
-        NSo::ProtoToSelectors(ReadParams.Source.GetSelectors(), selectors);
+        NSo::TSelectors selectors = NSo::ProtoToSelectors(ReadParams.Source.GetSelectors());
         PendingLabelRequests.push_back(selectors);
         TryFetch();
     }
@@ -351,7 +350,7 @@ private:
         for (const auto& metric : response.Result.Metrics) {
             NSo::MetricQueue::TMetric protoMetric;
             protoMetric.SetType(metric.Type);
-            NSo::SelectorsToProto(metric.Selectors, *protoMetric.MutableSelectors());
+            *protoMetric.MutableSelectors() = NSo::SelectorsToProto(metric.Selectors);
             Metrics.emplace_back(std::move(protoMetric));
         }
     }
@@ -391,7 +390,7 @@ private:
             auto selectors = PendingLabelRequests.back();
             PendingLabelRequests.pop_back();
             
-            auto labelsListingFuture = SolomonClient->ListMetricsLabels(selectors, TrueRangeFrom, TrueRangeTo);
+            auto labelsListingFuture = SolomonClient->ListMetricsLabels(selectors, ExtendedRange);
             labelsListingFuture.Subscribe([actorSystem, selectors = std::move(selectors), selfId = SelfId()]
                 (NThreading::TFuture<NSo::TListMetricsLabelsResponse> future) mutable {
                 actorSystem->Send(
@@ -406,7 +405,7 @@ private:
             auto selectors = PendingListingRequests.back();
             PendingListingRequests.pop_back();
 
-            auto metricsListingFuture = SolomonClient->ListMetrics(selectors, TrueRangeFrom, TrueRangeTo);
+            auto metricsListingFuture = SolomonClient->ListMetrics(selectors, ExtendedRange);
             metricsListingFuture.Subscribe([actorSystem, selfId = SelfId()]
                 (NThreading::TFuture<NSo::TListMetricsResponse> future) {
                 actorSystem->Send(
@@ -550,8 +549,7 @@ private:
     const bool EnableSolomonClientPostApi;
     const ui64 BatchCountLimit;
     const ui64 PrefetchSize;
-    const TInstant TrueRangeFrom;
-    const TInstant TrueRangeTo;
+    const NSo::TTimeRange ExtendedRange;
     const ui64 MaxListingPageSize;
     const ui64 MaxApiInflight;
     const TDuration PoisonTimeout;

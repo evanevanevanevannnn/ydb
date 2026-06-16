@@ -79,3 +79,18 @@ def get_api_calls_count():
 def cleanup_api_calls():
     url = "{}/cleanup/api/calls".format(get_api_url())
     _do_request("POST", url)
+
+
+def get_grpc_stats():
+    url = "{}/grpc/stats".format(get_api_url())
+    return _do_request("GET", url).json()
+
+
+def configure_grpc_read_delay(delay_sec):
+    url = "{}/grpc/config?read_delay_sec={}".format(get_api_url(), delay_sec)
+    _do_request("POST", url)
+
+
+def reset_grpc_stats():
+    url = "{}/grpc/stats/reset".format(get_api_url())
+    _do_request("POST", url)

@@ -1,7 +1,10 @@
 from aiohttp import web
+from datetime import datetime, timezone
 import json
 import logging
 import re
+import time
+import threading
 from concurrent import futures
 
 from library.python.monlib.encoder import loads
@@ -43,11 +46,71 @@ def _parse_selectors(selectors):
     return (result, True)
 
 
+def _parse_iso_to_ms(iso_str):
+    """Parse an ISO 8601 timestamp string to milliseconds since epoch.
+
+    Handles formats produced by TInstant::ToString(), e.g.:
+      "2026-06-16T09:00:00Z"
+      "2026-06-16T09:00:00.000000Z"
+    """
+    s = iso_str.strip()
+    # Remove trailing 'Z' and parse as UTC
+    if s.endswith('Z'):
+        s = s[:-1]
+    # Try parsing with fractional seconds first, then without
+    for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            continue
+    raise ValueError(f"Cannot parse timestamp: {iso_str}")
+
+
 class SolomonEmulator(object):
     def __init__(self, config):
         self._config = config
         self._api_calls = 0
         self._data = MultiShard()
+
+        # gRPC concurrency tracking (thread-safe, gRPC runs in a thread pool)
+        self._grpc_lock = threading.Lock()
+        self._grpc_concurrent_reads = 0
+        self._grpc_max_concurrent_reads = 0
+        self._grpc_total_reads = 0
+        self._grpc_read_delay_sec = 0.0
+
+    def on_read_start(self):
+        with self._grpc_lock:
+            self._grpc_concurrent_reads += 1
+            self._grpc_total_reads += 1
+            if self._grpc_concurrent_reads > self._grpc_max_concurrent_reads:
+                self._grpc_max_concurrent_reads = self._grpc_concurrent_reads
+
+    def on_read_end(self):
+        with self._grpc_lock:
+            self._grpc_concurrent_reads -= 1
+
+    def get_grpc_stats(self):
+        with self._grpc_lock:
+            return {
+                "max_concurrent_reads": self._grpc_max_concurrent_reads,
+                "total_reads": self._grpc_total_reads,
+            }
+
+    def reset_grpc_stats(self):
+        with self._grpc_lock:
+            self._grpc_concurrent_reads = 0
+            self._grpc_max_concurrent_reads = 0
+            self._grpc_total_reads = 0
+
+    def set_grpc_read_delay(self, delay_sec):
+        with self._grpc_lock:
+            self._grpc_read_delay_sec = delay_sec
+
+    def get_grpc_read_delay(self):
+        with self._grpc_lock:
+            return self._grpc_read_delay_sec
 
     def _get_shard(self, project, cluster, service):
         return self._data.get_or_create(project, cluster, service)
@@ -179,6 +242,46 @@ class SolomonEmulator(object):
 
         return web.json_response({"result": metrics, "page": {"pagesCount": 1, "totalCount": len(metrics)}})
 
+    async def sensors_data(self, request):
+        """Handle GetPointsCount requests: POST /api/v2/projects/{project}/sensors/data"""
+        self._api_calls += 1
+
+        project = request.match_info["project"]
+        body = await request.json()
+
+        program = body.get("program", "")
+        from_str = body.get("from", "")
+        to_str = body.get("to", "")
+
+        # Parse timestamps from ISO 8601 strings (e.g. "2026-06-16T09:00:00.000000Z")
+        try:
+            from_ms = _parse_iso_to_ms(from_str)
+            to_ms = _parse_iso_to_ms(to_str)
+        except Exception as e:
+            return web.HTTPBadRequest(text=f"Invalid timestamp: {e}")
+
+        # Extract selectors from count({selectors}) program
+        inner = program
+        if inner.startswith("count(") and inner.endswith(")"):
+            inner = inner[6:-1]
+
+        selectors, success = _parse_selectors(inner)
+        if not success:
+            return web.HTTPBadRequest(text="Invalid selectors in program")
+
+        # Determine project/cluster/service from selectors
+        sel_project = selectors.get("project", project)
+        sel_cluster = selectors.get("cluster", sel_project)
+        sel_service = selectors.get("service", "")
+
+        if not sel_service:
+            return web.HTTPBadRequest(text="service label must be specified")
+
+        shard = self._get_shard(sel_project, sel_cluster, sel_service)
+        count = shard.get_points_count(selectors, from_ms, to_ms)
+
+        return web.json_response({"scalar": count})
+
     async def metrics_get(self, request):
         cluster = request.rel_url.query.get('cluster', None) or request.rel_url.query['folderId']
         project = request.rel_url.query.get('project', cluster)
@@ -220,6 +323,18 @@ class SolomonEmulator(object):
         self._api_calls = 0
         return web.Response(status=200)
 
+    async def grpc_stats(self, request):
+        return web.json_response(self.get_grpc_stats())
+
+    async def grpc_stats_reset(self, request):
+        self.reset_grpc_stats()
+        return web.Response(status=200)
+
+    async def grpc_config(self, request):
+        delay = float(request.rel_url.query.get('read_delay_sec', '0'))
+        self.set_grpc_read_delay(delay)
+        return web.Response(status=200)
+
     def inc_api_calls(self):
         self._api_calls += 1
 
@@ -232,42 +347,64 @@ class DataService(DataServiceServicer):
         logger.debug('ReadRequest: %s', request)
 
         self._emulator.inc_api_calls()
+        self._emulator.on_read_start()
+        try:
+            delay = self._emulator.get_grpc_read_delay()
+            if delay > 0:
+                time.sleep(delay)
 
-        if request.container.HasField("project_id") and request.container.project_id in Shard.DEPRECATED_TESTS_PROJECTS:
-            return self.DeprecatedTestsLogic(request, context)
+            if request.container.HasField("project_id") and request.container.project_id in Shard.DEPRECATED_TESTS_PROJECTS:
+                return self.DeprecatedTestsLogic(request, context)
 
-        selectors, success = _parse_selectors(str(request.queries[0].value))
+            response = ReadResponse()
 
-        if not success:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("Coulnd't parse selectors")
-            return ReadResponse()
+            for query in request.queries:
+                selectors, success = _parse_selectors(str(query.value))
 
-        if request.container.HasField("project_id"):
-            selectors["project"] = request.container.project_id
-        else:
-            del selectors["folderId"]
-            selectors["project"] = request.container.folder_id
-            selectors["cluster"] = request.container.folder_id
+                if not success:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("Coulnd't parse selectors")
+                    return ReadResponse()
 
-        if "project" not in selectors or "cluster" not in selectors or "service" not in selectors:
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details("Selectors should contain ['project', 'cluster', 'service'] labels")
-            return ReadResponse()
+                if request.container.HasField("project_id"):
+                    selectors["project"] = request.container.project_id
+                else:
+                    del selectors["folderId"]
+                    selectors["project"] = request.container.folder_id
+                    selectors["cluster"] = request.container.folder_id
 
-        project = selectors["project"]
-        cluster = selectors["cluster"]
-        service = selectors["service"]
+                if "project" not in selectors or "cluster" not in selectors or "service" not in selectors:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details("Selectors should contain ['project', 'cluster', 'service'] labels")
+                    return ReadResponse()
 
-        shard = self._emulator._get_shard(project, cluster, service)
-        result, error = shard.get_data(selectors, request.from_time, request.to_time, request.downsampling)
+                project = selectors["project"]
+                cluster = selectors["cluster"]
+                service = selectors["service"]
 
-        if len(error):
-            context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-            context.set_details(error)
-            return ReadResponse()
+                shard = self._emulator._get_shard(project, cluster, service)
+                result, error = shard.get_data(selectors, request.from_time, request.to_time, request.downsampling)
 
-        return self._build_read_response(result["labels"], result["type"], result["timestamps"], result["values"])
+                if len(error):
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details(error)
+                    return ReadResponse()
+
+                response_query = response.response_per_query.add()
+                response_query.query_name = "query"
+
+                timeseries = response_query.timeseries_vector.values.add()
+                for key, value in result["labels"].items():
+                    timeseries.labels[key] = str(value)
+                timeseries.type = DataService._map_metric_type(result["type"])
+
+                timeseries.timestamp_values.values.extend(result["timestamps"])
+                timeseries.double_values.values.extend(result["values"])
+
+            logger.debug('ReadResponse: %s', response)
+            return response
+        finally:
+            self._emulator.on_read_end()
 
     def DeprecatedTestsLogic(self, request: ReadRequest, context):
         project = request.container.project_id
@@ -280,7 +417,21 @@ class DataService(DataServiceServicer):
         if project == "my_project" or project == "hist":
             labels = self._dict_to_labels(request)
             labels["project"] = project
-            return self._build_read_response(labels, "RATE", [10000, 20000, 30000], [100, 200, 300])
+
+            response = ReadResponse()
+
+            response_query = response.response_per_query.add()
+            response_query.query_name = "query"
+
+            timeseries = response_query.timeseries_vector.values.add()
+            for key, value in labels.items():
+                timeseries.labels[key] = str(value)
+            timeseries.type = DataService._map_metric_type("RATE")
+
+            timeseries.timestamp_values.values.extend([10000, 20000, 30000])
+            timeseries.double_values.values.extend([100, 200, 300])
+
+            return response
 
     @staticmethod
     def _map_metric_type(kind):
@@ -310,27 +461,11 @@ class DataService(DataServiceServicer):
 
         return result
 
-    @staticmethod
-    def _build_read_response(labels, type, timestamps, values):
-        response = ReadResponse()
-
-        response_query = response.response_per_query.add()
-        response_query.query_name = "query"
-
-        timeseries = response_query.timeseries_vector.values.add()
-        for key, value in labels.items():
-            timeseries.labels[key] = str(value)
-        timeseries.type = DataService._map_metric_type(type)
-
-        timeseries.timestamp_values.values.extend(timestamps)
-        timeseries.double_values.values.extend(values)
-
-        return response
-
 
 def create_web_app(emulator):
     webapp = web.Application()
     webapp.add_routes([
+        web.post("/api/v2/projects/{project}/sensors/data", emulator.sensors_data),
         web.post("/api/v2/projects/{project}/sensors/names", emulator.sensor_names),
         web.post("/api/v2/projects/{project}/sensors/labels", emulator.sensor_labels),
         web.post("/api/v2/projects/{project}/sensors", emulator.sensors),
@@ -341,7 +476,10 @@ def create_web_app(emulator):
         web.post("/monitoring/v2/data/write", emulator.data_write),
         web.post("/metrics/post", emulator.metrics_post),
         web.post("/cleanup", emulator.cleanup),
-        web.post("/cleanup/api/calls", emulator.cleanup_api_calls)
+        web.post("/cleanup/api/calls", emulator.cleanup_api_calls),
+        web.get("/grpc/stats", emulator.grpc_stats),
+        web.post("/grpc/stats/reset", emulator.grpc_stats_reset),
+        web.post("/grpc/config", emulator.grpc_config)
     ])
 
     return webapp

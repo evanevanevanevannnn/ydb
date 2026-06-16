@@ -19,16 +19,24 @@ class TestBasicReading(SolomonReadingTestBase):
         timestamps = [int(row["ts"].replace(tzinfo=timezone.utc).timestamp()) for row in result[0].rows]
         values = [int(row["value"]) for row in result[0].rows]
 
-        downsampled_timestamps = [ts for ts in self.basic_reading_timestamps if ts % 15 == 0]
-        downsampled_values = [value for value in self.basic_reading_values if value % 3 == 0]
+        if downsampling_disabled:
+            canon_timestamps = self.basic_reading_timestamps
+            canon_values = self.basic_reading_values
+        else:
+            # Default grid is 15 seconds; base is aligned to 15s boundary,
+            # so every 3rd timestamp (at 0s, 15s, 30s, 45s offsets) survives.
+            canon_timestamps = [ts for ts in self.basic_reading_timestamps if ts % 15 == 0]
+            canon_values = [
+                self.basic_reading_values[i]
+                for i, ts in enumerate(self.basic_reading_timestamps) if ts % 15 == 0
+            ]
 
-        canon_timestamps = self.basic_reading_timestamps if downsampling_disabled else downsampled_timestamps
-        canon_values = self.basic_reading_values if downsampling_disabled else downsampled_values
-
-        if timestamps != canon_timestamps:
-            return False, "timstamps differ from canonical, have {}, should be {}".format(timestamps, canon_timestamps)
-        elif values != canon_values:
-            return False, "values differ from canonical, have {}, should be {}".format(values, canon_values)
+        if sorted(timestamps) != sorted(canon_timestamps):
+            return False, "timestamps differ from canonical, have {}, should be {}".format(
+                sorted(timestamps), sorted(canon_timestamps))
+        elif sorted(values) != sorted(canon_values):
+            return False, "values differ from canonical, have {}, should be {}".format(
+                sorted(values), sorted(canon_values))
         return True, None
 
     def check_query_result_size(self, result, error):
@@ -55,104 +63,104 @@ class TestBasicReading(SolomonReadingTestBase):
         result, error = self.execute_query(data_source_query)
         assert error is None
 
-        # simplest query with default downsampling settings
-        query = """
+        # simplest query with default downsampling settings (default grid = 15s)
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                program = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                program = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), False)
         assert succes, error
 
         # query using `program` param with enabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                program = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                program = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "false",
                 `downsampling.aggregation` = "AVG",
                 `downsampling.fill` = "PREVIOUS",
                 `downsampling.grid_interval` = "15",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), False)
         assert succes, error
 
         # query using `program` param with disabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                program = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                program = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "true",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), True)
         assert succes, error
 
         # query using `selectors` param with enabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                selectors = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                selectors = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "false",
                 `downsampling.aggregation` = "AVG",
                 `downsampling.fill` = "PREVIOUS",
                 `downsampling.grid_interval` = "15",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), False)
         assert succes, error
 
         # query using `selectors` param with disabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                selectors = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                selectors = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "true",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), True)
         assert succes, error
 
         # query using `labels` param
-        query = """
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                selectors = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                selectors = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 labels = "test_type",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         result, error = self.execute_query(query)
         assert error is None, error
         assert any(column.name == "test_type" for column in result[0].columns)
 
-        # query using `labels` param
-        query = """
+        # query using `labels` param with alias
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                selectors = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                selectors = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 labels = "test_type as tt",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         result, error = self.execute_query(query)
@@ -160,12 +168,14 @@ class TestBasicReading(SolomonReadingTestBase):
         assert any(column.name == "tt" for column in result[0].columns)
 
         # query with a single second interval
-        query = """
+        single_from = self.basic_reading_from_iso
+        single_to = self._ts_to_iso(self.basic_reading_from_sec + 1)
+        query = f"""
             SELECT * FROM local_solomon.basic_reading WITH (
-                selectors = @@{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                selectors = @@{{cluster="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:00:01Z"
+                from = "{single_from}",
+                to = "{single_to}"
             )
         """
         succes, error = self.check_query_result_size(*self.execute_query(query))
@@ -186,104 +196,104 @@ class TestBasicReading(SolomonReadingTestBase):
         result, error = self.execute_query(data_source_query)
         assert error is None
 
-        # simplest query with default downsampling settings
-        query = """
+        # simplest query with default downsampling settings (default grid = 15s)
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                program = @@{folderId="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                program = @@{{folderId="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), False)
         assert succes, error
 
         # query using `program` param with enabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                program = @@{folderId="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                program = @@{{folderId="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "false",
                 `downsampling.aggregation` = "AVG",
                 `downsampling.fill` = "PREVIOUS",
                 `downsampling.grid_interval` = "15",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), False)
         assert succes, error
 
         # query using `program` param with disabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                program = @@{folderId="basic_reading", service="my_service", test_type="basic_reading_test"}@@,
+                program = @@{{folderId="basic_reading", service="my_service", test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "true",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), True)
         assert succes, error
 
         # query using `selectors` param with enabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="basic_reading_test"}@@,
+                selectors = @@{{test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "false",
                 `downsampling.aggregation` = "AVG",
                 `downsampling.fill` = "PREVIOUS",
                 `downsampling.grid_interval` = "15",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), False)
         assert succes, error
 
         # query using `selectors` param with disabled downsampling
-        query = """
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="basic_reading_test"}@@,
+                selectors = @@{{test_type="basic_reading_test"}}@@,
 
                 `downsampling.disabled` = "true",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         succes, error = self.check_query_result(*self.execute_query(query), True)
         assert succes, error
 
         # query using `labels` param
-        query = """
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="basic_reading_test"}@@,
+                selectors = @@{{test_type="basic_reading_test"}}@@,
 
                 labels = "test_type",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         result, error = self.execute_query(query)
         assert error is None, error
         assert any(column.name == "test_type" for column in result[0].columns)
 
-        # query using `labels` param
-        query = """
+        # query using `labels` param with alias
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="basic_reading_test"}@@,
+                selectors = @@{{test_type="basic_reading_test"}}@@,
 
                 labels = "test_type as tt",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.basic_reading_from_iso}",
+                to = "{self.basic_reading_to_iso}"
             )
         """
         result, error = self.execute_query(query)
@@ -291,12 +301,14 @@ class TestBasicReading(SolomonReadingTestBase):
         assert any(column.name == "tt" for column in result[0].columns)
 
         # query with a single second interval
-        query = """
+        single_from = self.basic_reading_from_iso
+        single_to = self._ts_to_iso(self.basic_reading_from_sec + 1)
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="basic_reading_test"}@@,
+                selectors = @@{{test_type="basic_reading_test"}}@@,
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:00:01Z"
+                from = "{single_from}",
+                to = "{single_to}"
             )
         """
         succes, error = self.check_query_result_size(*self.execute_query(query))

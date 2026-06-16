@@ -46,21 +46,21 @@ class TestDataPaging(SolomonReadingTestBase):
         result, error = self.execute_query(data_source_query)
         assert error is None
 
-        query = """
+        query = f"""
             SELECT value FROM local_solomon.data_paging WITH (
-                selectors = @@{cluster="data_paging", service="my_service", test_type="data_paging_test"}@@,
+                selectors = @@{{cluster="data_paging", service="my_service", test_type="data_paging_test"}}@@,
 
-                `downsampling.grid_interval` = "5",
+                `downsampling.disabled` = "true",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-03T00:00:00Z"
+                from = "{self.data_paging_from_iso}",
+                to = "{self.data_paging_to_iso}"
             )
         """
         success, error = self.check_data_paging_result(*self.execute_query(query))
         assert success, error
 
     @link_test_case("#23191")
-    def test_listing_paging_monitoring(self):
+    def test_data_paging_monitoring(self):
         data_source_query = f"""
             CREATE EXTERNAL DATA SOURCE local_monitoring WITH (
                 SOURCE_TYPE     = "Monium.Metrics",
@@ -74,14 +74,14 @@ class TestDataPaging(SolomonReadingTestBase):
         result, error = self.execute_query(data_source_query)
         assert error is None
 
-        query = """
+        query = f"""
             SELECT value FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="data_paging_test"}@@,
+                selectors = @@{{test_type="data_paging_test"}}@@,
 
-                `downsampling.grid_interval` = "5",
+                `downsampling.disabled` = "true",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-03T00:00:00Z"
+                from = "{self.data_paging_from_iso}",
+                to = "{self.data_paging_to_iso}"
             )
         """
         success, error = self.check_data_paging_result(*self.execute_query(query))

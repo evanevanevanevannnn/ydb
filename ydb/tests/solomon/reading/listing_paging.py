@@ -59,25 +59,25 @@ class TestListingPaging(SolomonReadingTestBase):
         result, error = self.execute_query(data_source_query)
         assert error is None
 
-        query = """
+        query = f"""
             SELECT test_label FROM local_solomon.listing_paging WITH (
-                selectors = @@{cluster="listing_paging", service="my_service", test_type="listing_paging_test", test_label="*"}@@,
+                selectors = @@{{cluster="listing_paging", service="my_service", test_type="listing_paging_test", test_label="*"}}@@,
 
                 labels = "test_label",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.listing_paging_from_iso}",
+                to = "{self.listing_paging_to_iso}"
             )
         """
         success, error = self.check_full_listing_result(*self.execute_query(query))
         assert success, error
 
-        query = """
+        query = f"""
             SELECT * FROM local_solomon.listing_paging WITH (
-                selectors = @@{cluster="listing_paging", service="my_service", test_type="listing_paging_test"}@@,
+                selectors = @@{{cluster="listing_paging", service="my_service", test_type="listing_paging_test"}}@@,
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.listing_paging_from_iso}",
+                to = "{self.listing_paging_to_iso}"
             )
         """
         success, error = self.check_listing_size(*self.execute_query(query))
@@ -98,25 +98,25 @@ class TestListingPaging(SolomonReadingTestBase):
         result, error = self.execute_query(data_source_query)
         assert error is None
 
-        query = """
+        query = f"""
             SELECT test_label FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="listing_paging_test", test_label="*"}@@,
+                selectors = @@{{test_type="listing_paging_test", test_label="*"}}@@,
 
                 labels = "test_label",
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.listing_paging_from_iso}",
+                to = "{self.listing_paging_to_iso}"
             )
         """
         success, error = self.check_full_listing_result(*self.execute_query(query))
         assert success, error
 
-        query = """
+        query = f"""
             SELECT * FROM local_monitoring.my_service WITH (
-                selectors = @@{test_type="listing_paging_test"}@@,
+                selectors = @@{{test_type="listing_paging_test"}}@@,
 
-                from = "1970-01-01T00:00:00Z",
-                to = "1970-01-01T00:01:00Z"
+                from = "{self.listing_paging_from_iso}",
+                to = "{self.listing_paging_to_iso}"
             )
         """
         success, error = self.check_listing_size(*self.execute_query(query))
